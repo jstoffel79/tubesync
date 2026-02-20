@@ -124,16 +124,23 @@ class DashboardView(TemplateView):
     def get_context_data(self, *args, **kwargs):
         data = super().get_context_data(*args, **kwargs)
         data['now'] = timezone.now()
-        # Sources
-        data['num_sources'] = Source.objects.all().count()
-        data['num_video_sources'] = Source.objects.filter(
-            ~Q(source_resolution=Val(SourceResolution.AUDIO))
-        ).count()
-        data['num_audio_sources'] = data['num_sources'] - data['num_video_sources']
-        data['num_failed_sources'] = Source.objects.filter(has_failed=True).count()
-        # Media
-        data['num_media'] = Media.objects.all().count()
-        data['num_downloaded_media'] = Media.objects.filter(downloaded=True).count()
+        # Sources — one aggregate query instead of 3 separate COUNTs
+        source_stats = Source.objects.aggregate(
+            total=Count('pk'),
+            video=Count('pk', filter=~Q(source_resolution=Val(SourceResolution.AUDIO))),
+            failed=Count('pk', filter=Q(has_failed=True)),
+        )
+        data['num_sources'] = source_stats['total']
+        data['num_video_sources'] = source_stats['video']
+        data['num_audio_sources'] = source_stats['total'] - source_stats['video']
+        data['num_failed_sources'] = source_stats['failed']
+        # Media — one aggregate query instead of 2 separate COUNTs
+        media_stats = Media.objects.aggregate(
+            total=Count('pk'),
+            downloaded=Count('pk', filter=Q(downloaded=True)),
+        )
+        data['num_media'] = media_stats['total']
+        data['num_downloaded_media'] = media_stats['downloaded']
         # Tasks
         completed_qs = TaskHistory.objects.filter(
             start_at__isnull=False,
