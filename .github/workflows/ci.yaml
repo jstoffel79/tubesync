@@ -215,6 +215,7 @@ jobs:
     permissions:
       contents: read # to fetch the repository content
       id-token: write # for signing attestation(s) with GitHub OIDC Token
+      packages: write # to push the image to ghcr.io using GITHUB_TOKEN
     secrets:
       registry-auths: |
         - registry: ${{ needs.info.outputs.REGISTRY }}
