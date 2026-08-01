@@ -552,6 +552,35 @@ def migrate_to_metadata(media_id):
     migrating_lock.acquired = False
 
 
+def _index_media_in_subprocess(source_id):
+    '''
+        Runs Source.index_media() in a forked child process and returns
+        its result. yt-dlp's extract_flat call for a channel/playlist tab
+        materializes the full entry list in memory before returning it --
+        for very large channels (~6700 videos) this has been measured to
+        peak around 3.3GB (meeb/tubesync#933/#955), even after upstream's
+        fix. Previously this was mitigated by capping TUBESYNC_WORKERS to
+        1, which throttles *all* task types (downloads, metadata,
+        thumbnails), not just indexing.
+
+        Running this specific call in a short-lived child process instead
+        confines that peak RSS to the child's own address space -- the OS
+        reclaims all of it the moment the child exits, so the long-lived
+        Huey worker process's own memory footprint stays flat regardless
+        of channel size. This is what actually lets TUBESYNC_WORKERS be
+        raised again for real concurrency elsewhere.
+
+        Runs in a *forked* child (Linux only), so Django's app registry is
+        already loaded -- no django.setup() needed. Inherited DB
+        connections are explicitly closed first: forking duplicates open
+        socket file descriptors, and sharing a live DB connection across
+        two processes is undefined behavior.
+    '''
+    db.connections.close_all()
+    source = Source.objects.get(pk=source_id)
+    return source.index_media()
+
+
 @db_task(delay=30, priority=80, queue=Val(TaskQueue.LIMIT))
 def index_source(source_id):
     '''
@@ -581,8 +610,13 @@ def index_source(source_id):
     update_model(source, target_schedule=source.target_schedule)
     # Reset any errors
     source.has_failed = False
-    # Index the source
-    videos = source.index_media()
+    # Index the source in an isolated child process so yt-dlp's peak
+    # memory usage for very large channels doesn't accumulate in this
+    # long-lived worker process.
+    import multiprocessing
+    ctx = multiprocessing.get_context('fork')
+    with ctx.Pool(processes=1, maxtasksperchild=1) as pool:
+        videos = pool.apply(_index_media_in_subprocess, (source_id,))
     if not videos:
         source.has_failed = True
         update_model(source, has_failed=source.has_failed)
