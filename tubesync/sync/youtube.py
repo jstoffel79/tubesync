@@ -5,13 +5,15 @@
 
 
 import os
+import shutil
+import time
 
 from common.errors import FormatUnavailableError
 from common.logger import log
 from common.utils import mkdir_p
 from copy import deepcopy
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, NamedTemporaryFile, gettempdir
 from urllib.parse import urlsplit, parse_qs
 
 from django.conf import settings
@@ -46,12 +48,44 @@ class YouTubeError(yt_dlp.utils.DownloadError):
     pass
 
 
+def _cleanup_stale_cookie_copies(tmp_dir, max_age_seconds=6 * 60 * 60):
+    # Best-effort cleanup of read-only cookie copies from crashed/killed
+    # tasks that never got to remove their own copy.
+    directory = Path(tmp_dir) if tmp_dir else Path(gettempdir())
+    now = time.time()
+    for stale in directory.glob('.cookies-*.txt'):
+        try:
+            if now - stale.stat().st_mtime > max_age_seconds:
+                stale.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def get_yt_opts():
     opts = deepcopy(_defaults)
     cookie_file = settings.COOKIES_FILE
     if cookie_file.is_file():
-        cookie_file_path = str(cookie_file.resolve())
-        log.info(f'[youtube-dl] using cookies.txt from: {cookie_file_path}')
+        # yt-dlp saves its cookiejar back to `cookiefile` whenever a
+        # YoutubeDL instance exits. With multiple tasks running
+        # concurrently against the same cookies.txt, this creates a
+        # race where a task that started earlier (and so has a
+        # stale/smaller cookiejar) finishes later and overwrites
+        # another task's newer save, eventually resetting the file to
+        # a near-empty state (see upstream issue meeb/tubesync#1536).
+        #
+        # Give yt-dlp a private, disposable copy per call so its
+        # writeback never touches the real cookies.txt.
+        tmp_dir = _youtubedl_tempdir or None
+        _cleanup_stale_cookie_copies(tmp_dir)
+        tmp = NamedTemporaryFile(
+            prefix='.cookies-', suffix='.txt',
+            dir=tmp_dir, delete=False,
+        )
+        tmp.close()
+        shutil.copyfile(str(cookie_file), tmp.name)
+        cookie_file_path = tmp.name
+        log.info(f'[youtube-dl] using cookies.txt from: {cookie_file.resolve()} '
+                  f'(read-only copy: {cookie_file_path})')
         opts.update({'cookiefile': cookie_file_path})
     return opts
 
