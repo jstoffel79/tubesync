@@ -6,6 +6,7 @@
 
 import os
 import shutil
+import subprocess
 import time
 
 from common.errors import FormatUnavailableError
@@ -46,6 +47,41 @@ class YouTubeError(yt_dlp.utils.DownloadError):
         Generic wrapped error for all errors that could be raised by youtube-dl.
     '''
     pass
+
+
+_nvenc_available_cache = {}
+
+
+def _nvenc_encoder_available(encoder='h264_nvenc'):
+    '''
+        ffmpeg listing an encoder in `-encoders` only means it was compiled
+        in -- it says nothing about whether the actual GPU on this host
+        supports it (e.g. an RTX 3050/Ampere card lists av1_nvenc in the
+        build but can't actually encode AV1 in hardware; only Ada
+        Lovelace/RTX 40-series and newer can). Do a real, tiny encode
+        instead of trusting the build flags, and cache the result for the
+        life of the process so this doesn't run per-download.
+    '''
+    if encoder in _nvenc_available_cache:
+        return _nvenc_available_cache[encoder]
+    try:
+        result = subprocess.run(
+            [
+                'ffmpeg', '-hide_banner', '-loglevel', 'error',
+                '-f', 'lavfi', '-i', 'nullsrc=s=256x256:d=0.1',
+                '-c:v', encoder, '-frames:v', '1', '-f', 'null', '-',
+            ],
+            capture_output=True, timeout=15,
+        )
+        available = (0 == result.returncode)
+        if not available:
+            log.info(f'[youtube-dl] {encoder} not usable on this host, '
+                      f'falling back to CPU encoding: {result.stderr.decode(errors="replace")[:300]}')
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.warning(f'[youtube-dl] {encoder} availability check failed: {e}')
+        available = False
+    _nvenc_available_cache[encoder] = available
+    return available
 
 
 def _cleanup_stale_cookie_copies(tmp_dir, max_age_seconds=6 * 60 * 60):
@@ -458,9 +494,23 @@ def download_media(
     codec_options = list()
     ofn = ytopts['outtmpl']
     if 'av1-' in ofn:
+        # RTX 3050 (Ampere) and similar consumer NVENC generations can't
+        # encode AV1 in hardware (that needs Ada Lovelace/RTX 40-series+),
+        # so this stays on the CPU encoder regardless of GPU availability.
         codec_options.extend(['-c:v', 'libsvtav1', '-preset', '8', '-crf', '35'])
     elif 'vp9-' in ofn:
+        # NVENC has no VP9 encode path on any current NVIDIA hardware
+        # generation -- CPU only here too.
         codec_options.extend(['-c:v', 'libvpx-vp9', '-b:v', '0', '-crf', '31', '-row-mt', '1', '-tile-columns', '2'])
+    elif _nvenc_encoder_available('h264_nvenc'):
+        # This is the common case: the ModifyChapters postprocessor's
+        # keyframe-cut re-encode (triggered by force_keyframes_at_cuts,
+        # needed for accurate SponsorBlock cuts) previously always ran on
+        # CPU here with no explicit codec, and was measured pegging this
+        # container's CPU limit during normal operation. Offload it to
+        # the GPU when available; -cq (constant quality) is NVENC's
+        # analog to CRF.
+        codec_options.extend(['-c:v', 'h264_nvenc', '-preset', 'p4', '-cq', '23'])
     if '-opus' in ofn:
         codec_options.extend(['-c:a', 'libopus'])
     set_ffmpeg_codec = (
