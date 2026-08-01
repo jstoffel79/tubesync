@@ -311,6 +311,67 @@ def prune_huey_task_history():
 
 
 @db_periodic_task(
+    huey_crontab(minute='*/10', strict=True,),
+    priority=10,
+    expires=5*60,
+    queue=Val(TaskQueue.DB),
+)
+def clear_stale_media_locks():
+    '''
+        Recovers automatically from the exact scenario hit in production:
+        a `media:{uuid}` or `index_media:{uuid}` lock left held by a task
+        that died or hung without releasing it (e.g. a stuck ffmpeg
+        subprocess, or a pod restart mid-task) -- this required manually
+        diagnosing and clearing the lock by hand.
+
+        Huey's TaskLock is a bare KV flag with no timestamp of its own
+        (see huey.api.TaskLock), so staleness can't be judged from the
+        lock alone. Instead, cross-reference every currently-held
+        media/index_media lock against TaskHistory (which IS timestamped)
+        for a task that's actually still running against that UUID within
+        MAX_RUN_TIME; a lock with no such running task backing it is
+        orphaned and safe to clear.
+    '''
+    from django_huey import DJANGO_HUEY, get_queue, lock_task
+
+    running_uuids = set()
+    for params in get_running_tasks().values_list('task_params', flat=True):
+        try:
+            args = params[0]
+            if args:
+                running_uuids.add(str(args[0]))
+        except (IndexError, TypeError, KeyError):
+            continue
+
+    lock_prefixes = ('media:', 'index_media:')
+    cleared = 0
+    for qn in DJANGO_HUEY.get('queues', dict()):
+        q = get_queue(qn)
+        try:
+            rows = q.storage.sql('select key from kv', results=True)
+        except Exception as e:
+            log.warning(f'clear_stale_media_locks: could not read lock storage for queue {qn}: {e}')
+            continue
+        for (key,) in rows:
+            if not isinstance(key, str) or '.lock.' not in key:
+                continue
+            _, _, lock_name = key.partition('.lock.')
+            for prefix in lock_prefixes:
+                if not lock_name.startswith(prefix):
+                    continue
+                lock_uuid = lock_name[len(prefix):]
+                if lock_uuid in running_uuids:
+                    break
+                lock_task(lock_name, queue=qn).clear()
+                cleared += 1
+                log.warning(f'clear_stale_media_locks: cleared orphaned lock: '
+                            f'{lock_name} (queue={qn})')
+                break
+    if cleared:
+        log.warning(f'clear_stale_media_locks: cleared {cleared} orphaned lock(s)')
+
+
+@db_periodic_task(
     huey_crontab(minute=40, strict=True,),
     priority=100,
     expires=15*60,
@@ -1126,7 +1187,20 @@ def on_complete_download_media_image(signal_name, task_obj, exception_obj=None, 
     if result is False or result is True:
         huey.result(preserve=False, id=task_obj.id)
 
-@db_task(delay=60, priority=70, queue=Val(TaskQueue.LIMIT))
+@db_task(
+    delay=60, priority=70, queue=Val(TaskQueue.LIMIT),
+    retries=3, retry_delay=300,
+    # The 'limited' queue runs a single *process* worker, so a hang here
+    # (e.g. a stuck ffmpeg subprocess during remux/keyframe postprocessing)
+    # blocks every other download indefinitely, with no automatic
+    # recovery -- this happened in production and required manually
+    # killing the pod and clearing an orphaned media:{uuid} lock by hand.
+    # `timeout` is enforced by huey at the process level: if exceeded, the
+    # worker process is killed and respawned, restoring queue throughput
+    # even though this specific attempt failed. Generous (3h) since large
+    # 4K downloads/remuxes can legitimately run long.
+    timeout=3*60*60,
+)
 def download_media_file(media_id, override=False):
     '''
         Downloads the media to disk and attaches it to the Media instance.
