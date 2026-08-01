@@ -34,9 +34,16 @@ jobs:
       IMAGE_NAME: ${{ env.IMAGE_NAME }}
       REGISTRY: ${{ env.REGISTRY }}
       ejs-latest-release: ${{ steps.ejs.outputs.latest-release }}
-      ffmpeg-date: ${{ steps.ffmpeg.outputs.date }}
+      # Pinned instead of using steps.ffmpeg.outputs.{date,version} (always
+      # the newest FFmpeg-Builds release): that build's ffnvcodec headers
+      # require driver >=610.00 for h264_nvenc, but no NVIDIA driver that
+      # new has been released -- so NVENC/GPU transcoding silently never
+      # worked. Verified this specific build (2025-03-31) actually
+      # encodes h264_nvenc successfully against real hardware on driver
+      # 570.172.08. Re-test before bumping this pin to a newer release.
+      ffmpeg-date: '2025-03-31-14-21'
       # ffmpeg-releases: ${{ steps.ffmpeg.outputs.releases }}
-      ffmpeg-version: ${{ steps.ffmpeg.outputs.version }}
+      ffmpeg-version: 'N-119096-g256a38101f'
       lowercase-github-actor: ${{ steps.github-actor.outputs.lowercase }}
       lowercase-github-repository_owner: ${{ steps.github-repository_owner.outputs.lowercase }}
       ytdlp-latest-release: ${{ steps.yt-dlp.outputs.latest-release }}
