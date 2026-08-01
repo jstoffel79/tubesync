@@ -27,7 +27,6 @@ from common.huey import CancelExecution, dynamic_retry, register_huey_signals
 from common.logger import log
 from common.models import TaskHistory
 from common.errors import (
-    HueyConsumerError,
     DownloadFailedException, FormatUnavailableError,
     NoFormatException, NoMediaException, NoThumbnailException,
     QuerySetEmptyError,
@@ -289,6 +288,29 @@ def delete_deleted_sources():
 
 
 @db_periodic_task(
+    huey_crontab(minute=45, strict=True,),
+    priority=10,
+    expires=10*60,
+    queue=Val(TaskQueue.DB),
+)
+def prune_huey_task_history():
+    '''
+        Huey's `task_history:*` KV storage was previously only pruned once,
+        at worker startup (see register_huey_signals() in common/huey.py).
+        Tasks that are interrupted/killed before firing a SIGNAL_COMPLETE
+        never get pruned by that signal handler, so this storage could
+        grow unbounded between restarts. Run it daily instead.
+    '''
+    from django_huey import DJANGO_HUEY, get_queue
+    from common.huey import prune_task_history
+    for qn in DJANGO_HUEY.get('queues', dict()):
+        q = get_queue(qn)
+        pruned = prune_task_history(q)
+        if pruned:
+            log.info(f'prune_huey_task_history: removed {pruned} entries from queue: {qn}')
+
+
+@db_periodic_task(
     huey_crontab(minute=40, strict=True,),
     priority=100,
     expires=15*60,
@@ -375,6 +397,18 @@ def contains_http429(q, task_id, /):
 
 
 def wait_for_errors(model, /, *, queue_name=None, task_name=None):
+    '''
+        If other tasks in `queue_name` have recently hit a 429, reschedule
+        this task via CancelExecution(retry=True) instead of running now.
+
+        This used to block the calling worker thread in a `time.sleep(5)`
+        loop for up to `10 * count` seconds. With several tasks hitting
+        429s at once, most/all threads in a queue could end up parked in
+        that sleep simultaneously, starving the queue's throughput for as
+        long as the delay lasted. Raising CancelExecution(retry=True)
+        instead hands the wait back to Huey's own retry/backoff scheduling,
+        so the worker thread is freed immediately to pick up other tasks.
+    '''
     if task_name is None:
         task_name=tuple((
             'sync.tasks.download_media_file',
@@ -387,30 +421,25 @@ def wait_for_errors(model, /, *, queue_name=None, task_name=None):
         ft = get_first_task(tn, instance=model)
         if ft:
             tasks.append(ft)
-    for task in tasks:
-        update_task_status(task, 'paused (429)')
 
     total_count = int()
     if queue_name:
         from django_huey import get_queue
         q = get_queue(queue_name)
         total_count += sum([ 1 if contains_http429(q, k) else 0 for k in q.all_results() ])
+    if total_count <= 0:
+        return
+
     delay = 10 * total_count
     time_str = seconds_to_timestr(delay)
-    db_down_path = Path('/run/service/huey-database/down')
-    fs_down_path = Path('/run/service/huey-filesystem/down')
-    log.info(f'waiting for errors: 429 ({time_str}): {model}')
-    while delay > 0:
-        # this happenes when the container is shutting down
-        # do not prevent that while we are delaying a task
-        if db_down_path.exists() and fs_down_path.exists():
-            break
-        time.sleep(5)
-        delay -= 5
+    log.info(f'waiting for errors: 429 (approx. {time_str}): {model}, rescheduling')
     for task in tasks:
-        update_task_status(task, None)
-    if delay > 0:
-        raise HueyConsumerError(_('queue consumer stopped'))
+        update_task_status(task, 'paused (429)')
+    try:
+        raise CancelExecution(_('waiting for 429 errors to clear'), retry=True)
+    finally:
+        for task in tasks:
+            update_task_status(task, None)
 
 
 @db_task(priority=90, queue=Val(TaskQueue.FS))
@@ -594,96 +623,114 @@ def index_source(source_id):
         )
     vn = 0
     video_keys = set()
-    while len(videos) > 0:
-        vn += 1
-        video = videos.popleft()
-        # Create or update each video as a Media object
-        key = video.get(source.key_field, None)
-        if not key:
-            # Video has no unique key (ID), it can't be indexed
-            continue
-        video_keys.add(key)
-        if len(db_batch_data) == db_batch_data.maxlen:
-            save_db_batch(Metadata.objects, db_batch_data, db_fields_data)
-        if len(db_batch_media) == db_batch_media.maxlen:
-            save_db_batch(Media.objects, db_batch_media, db_fields_media)
-        update_task_status(task, tvn_format.format(vn))
-        media_defaults = dict()
-        # create a dummy instance to use its functions
-        media = Media(source=source, key=key)
-        media_defaults['duration'] = float(video.get(fields('duration', media), None) or 0) or None
-        media_defaults['title'] = str(video.get(fields('title', media), ''))[:200]
-        site = video.get(fields('ie_key', media), None)
-        timestamp = video.get(fields('timestamp', media), None)
-        try:
-            published_dt = media.ts_to_dt(timestamp)
-        except AssertionError:
-            pass
-        else:
-            if published_dt:
-                media_defaults['published'] = published_dt
-        # Retrieve or create the actual media instance
-        media, new_media = source.media_source.only(
-            'uuid',
-            'source',
-            'key',
-            *db_fields_media,
-        ).get_or_create(defaults=media_defaults, source=source, key=key)
-        db_batch_media.append(media)
-        data, new_data = source.videos.defer('value').filter(
-            media__isnull=True,
-        ).get_or_create(source=source, key=key)
-        if site:
-            data.site = site
-        data.retrieved = source.last_crawl
-        data.value = { k: v for k,v in video.items() if v is not None }
-        db_batch_data.append(data)
-        migrating_lock = huey_lock_task(
-            f'index_media:{media.uuid}',
-            queue=Val(TaskQueue.FS),
-        )
-        if not migrating_lock.acquired:
-            migrating_lock.acquired = True
-        migrate_to_metadata(str(media.pk))
-        if not new_media:
-            # update the existing media
-            for key, value in media_defaults.items():
-                setattr(media, key, value)
-            log.debug(f'Indexed media: {vn}: {source} / {media}')
-        else:
-            # log the new media instances
-            log.info(f'Indexed new media: {source} / {media}')
-            log.info(f'Scheduling tasks to download thumbnail for: {media.key}')
-            thumbnail_fmt = 'https://i.ytimg.com/vi/{}/{}default.jpg'
-            for num, prefix in enumerate(reversed(('hq', 'sd', 'maxres',))):
-                thumbnail_url = thumbnail_fmt.format(
-                    media.key,
-                    prefix,
-                )
-                download_media_image.schedule(
-                    (str(media.pk), thumbnail_url,),
-                    priority=10+(5*num),
-                    delay=65-(30*num),
-                )
-            priority = download_media_metadata.settings.get('default_priority', 50)
-            if source.download_media:
-                priority += 5
+    try:
+        while len(videos) > 0:
+            vn += 1
+            video = videos.popleft()
+            # Create or update each video as a Media object
+            key = video.get(source.key_field, None)
+            if not key:
+                # Video has no unique key (ID), it can't be indexed
+                continue
+            video_keys.add(key)
+            if len(db_batch_data) == db_batch_data.maxlen:
+                save_db_batch(Metadata.objects, db_batch_data, db_fields_data)
+            if len(db_batch_media) == db_batch_media.maxlen:
+                save_db_batch(Media.objects, db_batch_media, db_fields_media)
+            update_task_status(task, tvn_format.format(vn))
+            media_defaults = dict()
+            # create a dummy instance to use its functions
+            media = Media(source=source, key=key)
+            media_defaults['duration'] = float(video.get(fields('duration', media), None) or 0) or None
+            media_defaults['title'] = str(video.get(fields('title', media), ''))[:200]
+            site = video.get(fields('ie_key', media), None)
+            timestamp = video.get(fields('timestamp', media), None)
+            try:
+                published_dt = media.ts_to_dt(timestamp)
+            except AssertionError:
+                pass
             else:
-                priority -= 5
-            log.info(f'Scheduling task to download metadata for: {media.url}')
-            TaskHistory.schedule(
-                download_media_metadata,
-                str(media.pk),
-                priority=priority,
-                remove_duplicates=True,
-                vn_fmt=_('Downloading metadata for: "{}": {}'),
-                vn_args=(media.key, media.name,),
+                if published_dt:
+                    media_defaults['published'] = published_dt
+            # Retrieve or create the actual media instance
+            media, new_media = source.media_source.only(
+                'uuid',
+                'source',
+                'key',
+                *db_fields_media,
+            ).get_or_create(defaults=media_defaults, source=source, key=key)
+            db_batch_media.append(media)
+            data, new_data = source.videos.defer('value').filter(
+                media__isnull=True,
+            ).get_or_create(source=source, key=key)
+            if site:
+                data.site = site
+            data.retrieved = source.last_crawl
+            data.value = { k: v for k,v in video.items() if v is not None }
+            db_batch_data.append(data)
+            migrating_lock = huey_lock_task(
+                f'index_media:{media.uuid}',
+                queue=Val(TaskQueue.FS),
             )
+            # `migrating_lock.acquired = True` runs through a property setter,
+            # whose return value an assignment statement always discards -- so
+            # the previous `if not migrating_lock.acquired: migrating_lock.acquired
+            # = True` both raced (check, then separate set) and never actually
+            # knew whether the acquire succeeded. migrate_to_metadata() was
+            # then scheduled unconditionally, so a migration already in flight
+            # for this media (lock held) could get a second, overlapping one.
+            # Call __enter__() directly to get a real success/failure result.
+            try:
+                migrating_lock.__enter__()
+            except Exception:
+                already_migrating = True
+            else:
+                already_migrating = False
+            if not already_migrating:
+                migrate_to_metadata(str(media.pk))
+            if not new_media:
+                # update the existing media
+                for key, value in media_defaults.items():
+                    setattr(media, key, value)
+                log.debug(f'Indexed media: {vn}: {source} / {media}')
+            else:
+                # log the new media instances
+                log.info(f'Indexed new media: {source} / {media}')
+                log.info(f'Scheduling tasks to download thumbnail for: {media.key}')
+                thumbnail_fmt = 'https://i.ytimg.com/vi/{}/{}default.jpg'
+                for num, prefix in enumerate(reversed(('hq', 'sd', 'maxres',))):
+                    thumbnail_url = thumbnail_fmt.format(
+                        media.key,
+                        prefix,
+                    )
+                    download_media_image.schedule(
+                        (str(media.pk), thumbnail_url,),
+                        priority=10+(5*num),
+                        delay=65-(30*num),
+                    )
+                priority = download_media_metadata.settings.get('default_priority', 50)
+                if source.download_media:
+                    priority += 5
+                else:
+                    priority -= 5
+                log.info(f'Scheduling task to download metadata for: {media.url}')
+                TaskHistory.schedule(
+                    download_media_metadata,
+                    str(media.pk),
+                    priority=priority,
+                    remove_duplicates=True,
+                    vn_fmt=_('Downloading metadata for: "{}": {}'),
+                    vn_args=(media.key, media.name,),
+                )
+    finally:
+        # Always flush whatever Metadata/Media updates have been
+        # accumulated so far, even if this task is interrupted or raises
+        # mid-run -- otherwise up to `maxlen` buffered updates per batch
+        # only ever existed in these in-memory deques and are lost.
+        save_db_batch(Metadata.objects, db_batch_data, db_fields_data)
+        save_db_batch(Media.objects, db_batch_media, db_fields_media)
     # Reset task.verbose_name to the saved value
     update_task_status(task, None)
-    # Update any remaining items in the batches
-    save_db_batch(Metadata.objects, db_batch_data, db_fields_data)
-    save_db_batch(Media.objects, db_batch_media, db_fields_media)
     # Cleanup of media no longer available from the source
     cleanup_removed_media(str(source.pk), video_keys)
     # Clear references to indexed data
@@ -775,12 +822,17 @@ def delete_media(media_id):
             f'index_media:{media.uuid}',
             queue=Val(TaskQueue.FS),
         )
-        if migrating_lock.acquired:
-            raise CancelExecution(_('media indexing in progress'), retry=True)
+        # Check migrating_lock *inside* the media:{uuid} lock, not before
+        # acquiring it: migrate_to_metadata() also does its actual field
+        # mutations inside a media:{uuid} lock, so checking-then-acting
+        # outside it left a window where a migration could start between
+        # the check here and the mutation below.
         with huey_lock_task(
             f'media:{media.uuid}',
             queue=Val(TaskQueue.DB),
         ):
+            if migrating_lock.acquired:
+                raise CancelExecution(_('media indexing in progress'), retry=True)
             media.delete()
 
 
@@ -796,12 +848,14 @@ def rename_media(media_id):
             f'index_media:{media.uuid}',
             queue=Val(TaskQueue.FS),
         )
-        if migrating_lock.acquired:
-            raise CancelExecution(_('media indexing in progress'), retry=True)
+        # See delete_media(): check inside the media:{uuid} lock to close
+        # the TOCTOU window against migrate_to_metadata()'s own mutations.
         with huey_lock_task(
             f'media:{media.uuid}',
             queue=Val(TaskQueue.DB),
         ):
+            if migrating_lock.acquired:
+                raise CancelExecution(_('media indexing in progress'), retry=True)
             media.rename_files()
 
 
@@ -817,12 +871,14 @@ def save_media(media_id):
             f'index_media:{media.uuid}',
             queue=Val(TaskQueue.FS),
         )
-        if migrating_lock.acquired:
-            raise CancelExecution(_('media indexing in progress'), retry=True)
+        # See delete_media(): check inside the media:{uuid} lock to close
+        # the TOCTOU window against migrate_to_metadata()'s own mutations.
         with huey_lock_task(
             f'media:{media.uuid}',
             queue=Val(TaskQueue.DB),
         ):
+            if migrating_lock.acquired:
+                raise CancelExecution(_('media indexing in progress'), retry=True)
             save_model(media)
 
 
@@ -1205,15 +1261,19 @@ def rename_all_media_for_source(source_id):
             f'index_media:{media.uuid}',
             queue=Val(TaskQueue.FS),
         )
-        if migrating_lock.acquired:
-            # good luck to you in the queue!
-            rename_media(str(media.pk))
-            continue
         try:
             with huey_lock_task(
                 f'media:{media.uuid}',
                 queue=Val(TaskQueue.DB),
             ):
+                # Checked inside the media:{uuid} lock (not before
+                # acquiring it) so a migration can't start in the gap
+                # between the check and rename_files() below -- see
+                # delete_media()/rename_media()/save_media().
+                if migrating_lock.acquired:
+                    # good luck to you in the queue!
+                    rename_media(str(media.pk))
+                    continue
                 with atomic(durable=False):
                     media.rename_files()
         except TaskLockedException:

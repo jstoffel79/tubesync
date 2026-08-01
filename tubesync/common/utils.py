@@ -401,19 +401,9 @@ def django_queryset_generator(query_set, /, *,
         qs = qs.order_by('pk')
     collecting = gc.isenabled()
     gc.disable()
-    if use_chunked_fetch:
-        for key in qs._iterator(use_chunked_fetch, chunk_size):
-            try:
-                yield query_set.filter(pk=key)[0]
-            except IndexError as exc:
-                msg = f'missing primary key: {key}'
-                raise QuerySetEmptyError(msg, exc=exc, key=key) from exc
-            key = None
-            gc.collect(generation=1)
-        key = None
-    else:
-        for page in iter(Paginator(qs, page_size)):
-            for key in page.object_list:
+    try:
+        if use_chunked_fetch:
+            for key in qs._iterator(use_chunked_fetch, chunk_size):
                 try:
                     yield query_set.filter(pk=key)[0]
                 except IndexError as exc:
@@ -422,11 +412,29 @@ def django_queryset_generator(query_set, /, *,
                 key = None
                 gc.collect(generation=1)
             key = None
+        else:
+            for page in iter(Paginator(qs, page_size)):
+                for key in page.object_list:
+                    try:
+                        yield query_set.filter(pk=key)[0]
+                    except IndexError as exc:
+                        msg = f'missing primary key: {key}'
+                        raise QuerySetEmptyError(msg, exc=exc, key=key) from exc
+                    key = None
+                    gc.collect(generation=1)
+                key = None
+                page = None
+                gc.collect()
             page = None
-            gc.collect()
-        page = None
-    qs = None
-    gc.collect()
-    if collecting:
-        gc.enable()
+        qs = None
+    finally:
+        # Runs even if the caller stops iterating early (a bare `return`
+        # inside a `for ... in qs_gen(...)` loop closes the generator via
+        # GeneratorExit here) or an exception propagates through. Without
+        # this, gc.disable() above leaks past this call — and since Huey
+        # runs multiple worker threads in one process, that disables GC
+        # for every other task running concurrently in the same process.
+        gc.collect()
+        if collecting:
+            gc.enable()
 

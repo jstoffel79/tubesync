@@ -510,6 +510,48 @@ def historical_task(signal_name, task_obj, exception_obj=None, /, *, huey=None):
 
 # Registration of shared signal handlers
 
+def prune_task_history(q, /, *, max_age=datetime.timedelta(days=7)):
+    '''
+        Removes `task_history:*` KV entries (and their associated result,
+        if any) older than `max_age` from a queue's storage.
+
+        This used to run only once, from register_huey_signals() at
+        worker startup. Tasks that are interrupted/killed before firing a
+        SIGNAL_COMPLETE never get pruned by that signal handler either, so
+        between worker restarts this storage can grow unbounded. Called
+        here so it can also be scheduled periodically (see
+        prune_all_task_history() in sync/tasks.py).
+    '''
+    now_time = time.monotonic()
+    now_dt = datetime.datetime.now(datetime.timezone.utc)
+    pruned = 0
+    for key in q.all_results().keys():
+        if not key.startswith(storage_key_prefix):
+            continue
+        history = q.get(peek=True, key=key)
+        if not isinstance(history, dict):
+            continue
+        if 'created' not in history:
+            # Set an incorrect created time to ensure eventual removal.
+            history['created'] = now_dt
+            q.put(key=key, data=history)
+            # Attempt to calculate an accurate age.
+            # This doesn't work all the time,
+            # so the created datetime is the fail-safe case.
+            seconds = now_time - history.get(signals.SIGNAL_EXECUTING, now_time)
+            age = datetime.timedelta(
+                seconds=(seconds if seconds > 0 else 0),
+            )
+        else:
+            age = now_dt - history['created']
+        if age > max_age:
+            result_key = key[len(storage_key_prefix) :]
+            q.get(peek=False, key=result_key)
+            q.get(peek=False, key=key)
+            pruned += 1
+    return pruned
+
+
 def register_huey_signals():
     from django import db
     from django_huey import DJANGO_HUEY, get_queue, pre_execute, post_execute, signal
@@ -537,29 +579,5 @@ def register_huey_signals():
         signal(signals.SIGNAL_EXECUTING, queue=qn)(on_executing_remove_duplicates)
 
         # clean up old history and results from storage
-        now_time = time.monotonic()
-        now_dt = datetime.datetime.now(datetime.timezone.utc)
-        for key in q.all_results().keys():
-            if not key.startswith(storage_key_prefix):
-                continue
-            history = q.get(peek=True, key=key)
-            if not isinstance(history, dict):
-                continue
-            if 'created' not in history:
-                # Set an incorrect created time to ensure eventual removal.
-                history['created'] = now_dt
-                q.put(key=key, data=history)
-                # Attempt to calculate an accurate age.
-                # This doesn't work all the time,
-                # so the created datetime is the fail-safe case.
-                seconds = now_time - history.get(signals.SIGNAL_EXECUTING, now_time)
-                age = datetime.timedelta(
-                    seconds=(seconds if seconds > 0 else 0),
-                )
-            else:
-                age = now_dt - history['created']
-            if age > datetime.timedelta(days=7):
-                result_key = key[len(storage_key_prefix) :]
-                q.get(peek=False, key=result_key)
-                q.get(peek=False, key=key)
+        prune_task_history(q)
 

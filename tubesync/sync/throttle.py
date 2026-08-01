@@ -13,8 +13,11 @@
 '''
 
 
+import fcntl
 import json
+import os
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from django.conf import settings
@@ -23,6 +26,7 @@ from common.logger import log
 
 
 STATE_FILE = Path(settings.CONFIG_BASE_DIR) / 'throttle_state.json'
+LOCK_FILE = STATE_FILE.with_suffix('.lock')
 
 # how many throttle-signature errors...
 ERROR_THRESHOLD = getattr(settings, 'THROTTLE_ERROR_THRESHOLD', 5)
@@ -55,10 +59,33 @@ def _load():
 
 
 def _save(state):
+    # Write to a temp file and rename over the real path: os.replace() is
+    # atomic on the same filesystem, so a reader never sees a truncated
+    # or partially-written file, even if this process is killed mid-write.
+    tmp_path = STATE_FILE.with_suffix('.json.tmp')
     try:
-        STATE_FILE.write_text(json.dumps(state))
+        tmp_path.write_text(json.dumps(state))
+        os.replace(tmp_path, STATE_FILE)
     except OSError as e:
         log.warning(f'throttle: failed to persist state to {STATE_FILE}: {e}')
+
+
+@contextmanager
+def _locked_state():
+    '''
+        Read-modify-write the state file under an exclusive file lock, so
+        concurrent Huey workers calling record_error()/clear_cooldown() at
+        the same time can't lose one another's updates.
+    '''
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOCK_FILE, 'a+') as lock_fp:
+        fcntl.flock(lock_fp, fcntl.LOCK_EX)
+        try:
+            state = _load()
+            yield state
+            _save(state)
+        finally:
+            fcntl.flock(lock_fp, fcntl.LOCK_UN)
 
 
 def is_throttle_error(msg):
@@ -82,10 +109,9 @@ def in_cooldown():
 
 
 def clear_cooldown():
-    state = _load()
-    state.pop('cooldown_until', None)
-    state['hits'] = []
-    _save(state)
+    with _locked_state() as state:
+        state.pop('cooldown_until', None)
+        state['hits'] = []
 
 
 def _verify_throttled():
@@ -118,29 +144,34 @@ def record_error(msg):
     if not is_throttle_error(msg):
         return
     now = time.time()
-    state = _load()
-    hits = [t for t in state.get('hits', []) if now - t < WINDOW_SECONDS]
-    hits.append(now)
-    state['hits'] = hits
-    _save(state)
-    if len(hits) < ERROR_THRESHOLD:
+    # Increment the hit counter under lock (fast), then release the lock
+    # before doing the slow network verification below -- otherwise every
+    # other worker's record_error()/clear_cooldown() call would block for
+    # the duration of a yt-dlp request.
+    with _locked_state() as state:
+        hits = [t for t in state.get('hits', []) if now - t < WINDOW_SECONDS]
+        hits.append(now)
+        state['hits'] = hits
+        hit_count = len(hits)
+    if hit_count < ERROR_THRESHOLD:
         return
 
     log.warning(
-        f'throttle: {len(hits)} throttle-signature errors in the last '
+        f'throttle: {hit_count} throttle-signature errors in the last '
         f'{WINDOW_SECONDS}s, verifying before starting a cooldown'
     )
-    if _verify_throttled():
-        state['cooldown_until'] = now + COOLDOWN_SECONDS
+    confirmed = _verify_throttled()
+    with _locked_state() as state:
+        # always clear hits here: either we're starting a cooldown, or this
+        # was a false alarm and shouldn't re-trigger verification on every
+        # subsequent error until the window rolls over
         state['hits'] = []
-        _save(state)
+        if confirmed:
+            state['cooldown_until'] = now + COOLDOWN_SECONDS
+    if confirmed:
         log.warning(
             f'throttle: confirmed, pausing downloads/indexing for '
             f'{COOLDOWN_SECONDS}s (until {time.ctime(now + COOLDOWN_SECONDS)})'
         )
     else:
-        # false alarm: don't let the same burst re-trigger verification
-        # on every subsequent error until the window rolls over
-        state['hits'] = []
-        _save(state)
         log.info('throttle: verification request succeeded, not starting a cooldown')
