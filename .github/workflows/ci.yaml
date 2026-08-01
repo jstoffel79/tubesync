@@ -38,12 +38,22 @@ jobs:
       # the newest FFmpeg-Builds release): that build's ffnvcodec headers
       # require driver >=610.00 for h264_nvenc, but no NVIDIA driver that
       # new has been released -- so NVENC/GPU transcoding silently never
-      # worked. Verified this specific build (2025-03-31) actually
-      # encodes h264_nvenc successfully against real hardware on driver
-      # 570.172.08. Re-test before bumping this pin to a newer release.
-      ffmpeg-date: '2025-03-31-14-21'
+      # worked.
+      #
+      # Releases older than ~2025-10 fail to download here at all: asfald
+      # (the tool the Dockerfile uses to fetch this asset) errors with
+      # "HTTP request failed: error decoding response body" against
+      # however GitHub serves aged release assets -- verified this isn't
+      # data-specific (plain curl fetches the exact same URL fine) and
+      # isn't CI-specific (reproduced identically with a local `docker
+      # build --target ffmpeg-download`). autobuild-2025-10-31 is the
+      # oldest release confirmed to both (a) download successfully via
+      # asfald and (b) actually encode h264_nvenc against this cluster's
+      # real GPU hardware on driver 570.172.08. Re-verify both properties
+      # the same way before ever changing this pin.
+      ffmpeg-date: '2025-10-31-15-01'
       # ffmpeg-releases: ${{ steps.ffmpeg.outputs.releases }}
-      ffmpeg-version: 'N-119096-g256a38101f'
+      ffmpeg-version: 'N-121583-g4348bde2d2'
       lowercase-github-actor: ${{ steps.github-actor.outputs.lowercase }}
       lowercase-github-repository_owner: ${{ steps.github-repository_owner.outputs.lowercase }}
       ytdlp-latest-release: ${{ steps.yt-dlp.outputs.latest-release }}
