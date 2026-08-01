@@ -20,7 +20,7 @@ from ..models import Source
 from django import forms
 from ..forms import ScheduleTaskForm
 from ..tasks import (
-    get_task_map, map_task_to_instance, get_error_message,
+    get_task_map, map_tasks_to_instances, get_error_message,
     get_running_tasks, check_source_directory_exists,
 )
 
@@ -112,9 +112,20 @@ class TasksView(ListView):
         data['total_scheduled'] = scheduled_qs.count()
         data['wait_for_database_queue'] = False
 
+        # Collect every task we might render up front so the Source/Media
+        # instances they point at can be fetched in one batched query per
+        # model, instead of one query per task (this used to be an N+1
+        # query storm on installs with a large task queue).
+        show_all_errors = (data['total_errors'] + len(list(running_qs))) < self.paginate_by
+        all_tasks = list(running_qs)
+        if show_all_errors:
+            all_tasks += list(errors_qs)
+        all_tasks += list(data['tasks'])
+        instance_map = map_tasks_to_instances(all_tasks)
+
         def add_to_task(task):
             setattr(task, 'run_now', task.scheduled_at < now_dt)
-            obj, url = map_task_to_instance(task)
+            obj, url = instance_map.get(task.id, (None, None))
             if obj:
                 setattr(task, 'instance', obj)
                 setattr(task, 'url', url)
@@ -131,7 +142,7 @@ class TasksView(ListView):
             data['running'].append(task)
 
         # show all the errors when they fit on one page
-        if (data['total_errors'] + len(data['running'])) < self.paginate_by:
+        if show_all_errors:
             for task in errors_qs:
                 if task in data['running']:
                     continue

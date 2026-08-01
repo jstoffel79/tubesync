@@ -36,6 +36,7 @@ from common.utils import (  django_queryset_generator as qs_gen,
                             remove_enclosed, seconds_to_timestr, )
 from .choices import Val, IndexSchedule, TaskQueue
 from .models import Source, Media, MediaServer, Metadata
+from .throttle import in_cooldown as throttle_in_cooldown, record_error as throttle_record_error
 from .utils import get_remote_image, resize_image_to_height, filter_response
 from .youtube import YouTubeError
 
@@ -56,41 +57,92 @@ def get_task_map():
     }
     return { f"sync.tasks.{k}": v for k,v in TASK_MAP.items() }
 
+def _task_model_and_uuid(task, /, *, task_map=None, model_url_map=None):
+    '''
+        Resolves a task down to (model, url, instance_uuid) without hitting
+        the database. Shared by map_task_to_instance() and the batched
+        map_tasks_to_instances().
+    '''
+    TASK_MAP = task_map if task_map is not None else get_task_map()
+    MODEL_URL_MAP = model_url_map if model_url_map is not None else {
+        Source: 'sync:source',
+        Media: 'sync:media-item',
+    }
+    model = TASK_MAP.get(task.name, None)
+    if not model:
+        return None, None, None
+    url = MODEL_URL_MAP.get(model, None)
+    if not url:
+        return None, None, None
+    task_args = task.task_params
+    if len(task_args) != 2:
+        return None, None, None
+    args, kwargs = task_args
+    if len(args) == 0:
+        return None, None, None
+    try:
+        instance_uuid = uuid.UUID(args[0])
+    except (TypeError, ValueError, AttributeError):
+        return None, None, None
+    return model, url, instance_uuid
+
+
 def map_task_to_instance(task):
     '''
         Reverse-maps a scheduled backgrond task to an instance. Requires the task name
         to be a known task function and the first argument to be a UUID. This is used
         because UUID's are incompatible with background_task's "creator" feature.
+
+        For rendering many tasks at once (e.g. the tasks list view), prefer
+        map_tasks_to_instances() instead: this does one .get() query per
+        call, which turns into an N+1 query storm over a large task list.
     '''
-    TASK_MAP = get_task_map()
-    MODEL_URL_MAP = {
-        Source: 'sync:source',
-        Media: 'sync:media-item',
-    }
-    # Unpack
-    task_func = task.name
-    model = TASK_MAP.get(task_func, None)
+    model, url, instance_uuid = _task_model_and_uuid(task)
     if not model:
-        return None, None
-    url = MODEL_URL_MAP.get(model, None)
-    if not url:
-        return None, None
-    task_args = task.task_params
-    if len(task_args) != 2:
-        return None, None
-    args, kwargs = task_args
-    if len(args) == 0:
-        return None, None
-    instance_uuid_str = args[0]
-    try:
-        instance_uuid = uuid.UUID(instance_uuid_str)
-    except (TypeError, ValueError, AttributeError):
         return None, None
     try:
         instance = model.objects.get(pk=instance_uuid)
         return instance, url
     except model.DoesNotExist:
         return None, None
+
+
+def map_tasks_to_instances(tasks):
+    '''
+        Batched equivalent of calling map_task_to_instance() once per task.
+        Looks up each referenced model with a single "pk__in=" query instead
+        of one query per task, then returns a dict of
+        {task.id: (instance_or_None, url_or_None)}.
+    '''
+    TASK_MAP = get_task_map()
+    MODEL_URL_MAP = {
+        Source: 'sync:source',
+        Media: 'sync:media-item',
+    }
+    # task.id -> (model, url, instance_uuid)
+    resolved = {
+        task.id: _task_model_and_uuid(task, task_map=TASK_MAP, model_url_map=MODEL_URL_MAP)
+        for task in tasks
+    }
+    # collect the set of pks to fetch per model
+    pks_by_model = {}
+    for model, _url, instance_uuid in resolved.values():
+        if model is None:
+            continue
+        pks_by_model.setdefault(model, set()).add(instance_uuid)
+    # one query per model instead of one query per task
+    instances_by_model = {
+        model: {obj.pk: obj for obj in model.objects.filter(pk__in=pks)}
+        for model, pks in pks_by_model.items()
+    }
+    result = {}
+    for task_id, (model, url, instance_uuid) in resolved.items():
+        if model is None:
+            result[task_id] = (None, None)
+            continue
+        instance = instances_by_model.get(model, {}).get(instance_uuid)
+        result[task_id] = (instance, url) if instance else (None, None)
+    return result
 
 
 def get_error_message(task):
@@ -815,6 +867,11 @@ def download_media_metadata(media_id):
         log.info(f'Task for ID: {media_id} / {media} skipped, due to task being manually skipped.')
         return
     source = media.source
+    cooling, remaining = throttle_in_cooldown()
+    if cooling:
+        log.info(f'download_media_metadata: in throttle cooldown ({int(remaining)}s left), '
+                 f'rescheduling: {media.key}')
+        raise CancelExecution(_('in throttle cooldown'), retry=True)
     wait_for_errors(
         media,
         queue_name=Val(TaskQueue.LIMIT),
@@ -861,6 +918,7 @@ def download_media_metadata(media_id):
                 media.save()
                 raise_exception = False
         if raise_exception:
+            throttle_record_error(e_str)
             raise
         log.debug(str(e))
     else:
@@ -994,6 +1052,12 @@ def download_media_file(media_id, override=False):
             # should raise an exception to avoid this
             return
 
+    cooling, remaining = throttle_in_cooldown()
+    if cooling:
+        log.info(f'download_media_file: in throttle cooldown ({int(remaining)}s left), '
+                 f'rescheduling: {media.key}')
+        raise CancelExecution(_('in throttle cooldown'), retry=True)
+
     wait_for_errors(
         media,
         queue_name=Val(TaskQueue.LIMIT),
@@ -1010,6 +1074,9 @@ def download_media_file(media_id, override=False):
         except FormatUnavailableError as e:
             media.failed_format(e.format, cause=e.exc, exc=e)
             raise CancelExecution(_('format did not work'), retry=True) from e.__cause__
+        except YouTubeError as e:
+            throttle_record_error(str(e))
+            raise
         except NoFormatException:
             # Try refreshing formats
             if media.has_metadata:
