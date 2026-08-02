@@ -15,7 +15,7 @@
   </div>
 </div>
 {% include 'infobox.html' with message=message %}
-<div class="row">
+<div class="row" id="system-status">
   <div class="col s12">
     <h2>System Status</h2>
     <p>
@@ -193,4 +193,34 @@
     <a href="{% url 'sync:reset-tasks' %}" class="btn">Reset tasks <i class="fas fa-history"></i></a>
   </div>
 </div>
+{% endblock %}
+{% block extra_js %}
+<script>
+  // Live-refreshes just the System Status panel in place every 30s --
+  // a full page reload would reset scroll position and be jarring on a
+  // page people leave open to watch. Re-fetches this same page's HTML
+  // and swaps in only the #system-status fragment; the rest of the page
+  // (Running/Errors/Scheduled lists) is left alone to avoid disrupting
+  // anything the user might be reading or about to click.
+  (function () {
+    var intervalMs = 30000;
+    function refreshSystemStatus() {
+      fetch(window.location.href, {headers: {'X-Requested-With': 'XMLHttpRequest'}})
+        .then(function (response) { return response.text(); })
+        .then(function (html) {
+          var next = new DOMParser().parseFromString(html, 'text/html')
+            .getElementById('system-status');
+          var current = document.getElementById('system-status');
+          if (next && current) {
+            current.replaceWith(next);
+          }
+        })
+        .catch(function () {
+          // A single failed refresh (e.g. a mid-rollout pod restart) isn't
+          // worth surfacing to the user -- the next tick will just retry.
+        });
+    }
+    setInterval(refreshSystemStatus, intervalMs);
+  })();
+</script>
 {% endblock %}
