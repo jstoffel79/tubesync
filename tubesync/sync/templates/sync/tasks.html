@@ -23,6 +23,13 @@
       resource limits it's using.
     </p>
     <div class="collection">
+      {% if pod_info.pod_name %}
+      <span class="collection-item">
+        <i class="fas fa-cube"></i> Pod <strong>{{ pod_info.pod_name }}</strong>
+        {% if pod_info.node_name %}on node <strong>{{ pod_info.node_name }}</strong>{% endif %}
+        {% if pod_info.pod_ip %}({{ pod_info.pod_ip }}){% endif %}
+      </span>
+      {% endif %}
       <span class="collection-item">
         <i class="fas fa-microchip"></i> CPU throttled:
         <strong>{{ cgroup_status.cpu_throttled_pct|default:"0" }}%</strong>
