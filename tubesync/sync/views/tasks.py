@@ -24,7 +24,7 @@ from ..tasks import (
     get_running_tasks, check_source_directory_exists,
     get_queue_status, get_cgroup_status, get_ffmpeg_status,
     get_lock_status, get_throttle_status, get_pod_info,
-    get_download_progress,
+    get_download_progress, get_task_breakdown,
 )
 
 
@@ -121,6 +121,7 @@ class TasksView(ListView):
         data['throttle_status'] = get_throttle_status()
         data['pod_info'] = get_pod_info()
         data['download_progress'] = get_download_progress()
+        data['task_breakdown'] = get_task_breakdown()
 
         # Collect every task we might render up front so the Source/Media
         # instances they point at can be fetched in one batched query per

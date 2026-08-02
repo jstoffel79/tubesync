@@ -232,6 +232,33 @@ def get_queue_status():
     return queues
 
 
+def get_task_breakdown(limit=8):
+    '''
+        Per-task-name breakdown of currently pending (enqueued, not yet
+        started) work, for the Tasks page. get_queue_status() alone only
+        shows aggregate depth per huey queue, which hides *what* is
+        actually queued -- this matters because several task types share
+        the same 'limited' single-worker queue, and one type (e.g.
+        refresh_formats, proactively scheduled for every not-yet-
+        downloaded video after indexing) can vastly outnumber and crowd
+        out another (e.g. download_media_file, the actual video
+        downloads) for a very long time without this being visible
+        anywhere else on the page.
+    '''
+    from django.db.models import Count
+    rows = (
+        TaskHistory.objects
+        .filter(start_at__isnull=True, failed_at__isnull=True)
+        .values('name')
+        .annotate(count=Count('id'))
+        .order_by('-count')[:limit]
+    )
+    return [
+        dict(name=row['name'].rsplit('.', 1)[-1], count=row['count'])
+        for row in rows
+    ]
+
+
 def get_cgroup_status():
     '''
         Reads this container's own cgroup v2 accounting -- the same limits

@@ -50,6 +50,12 @@
       {% empty %}
       <span class="collection-item no-items"><i class="fas fa-info-circle"></i> Queue status is unavailable.</span>
       {% endfor %}
+      {% if task_breakdown %}
+      <span class="collection-item">
+        <i class="fas fa-list-ol"></i> Pending by task type:
+        {% for t in task_breakdown %}{{ t.name }} ({{ t.count|intcomma }}){% if not forloop.last %}, {% endif %}{% endfor %}
+      </span>
+      {% endif %}
       <span class="collection-item{% if throttle_status.cooling %} error-text{% endif %}">
         <i class="fas fa-hourglass-half"></i>
         {% if throttle_status.cooling %}
