@@ -323,6 +323,48 @@ def get_ffmpeg_status():
         ))
     return processes
 
+
+def get_download_progress():
+    '''
+        Whether a download_media_file task is genuinely in progress right
+        now, regardless of which phase it's in. get_ffmpeg_status() alone
+        only catches the brief remux/keyframe-cut postprocessing window --
+        most of a download's wall-clock time is spent in yt-dlp's own
+        network fetch, with no ffmpeg process running at all, so "no
+        ffmpeg process" on its own reads as "nothing is happening" even
+        during a perfectly normal download. Reuses
+        get_genuinely_running_uuids() so an orphaned/stale lock (see
+        clear_stale_media_locks()) doesn't get reported as an active
+        download.
+    '''
+    lock_stale_after = getattr(settings, 'LOCK_STALE_AFTER_SECONDS', 3 * 60 * 60)
+    running_uuids = get_genuinely_running_uuids(lock_stale_after)
+    qs = TaskHistory.objects.running(within=lock_stale_after).filter(
+        name='sync.tasks.download_media_file',
+    ).order_by('-start_at')
+    for task in qs:
+        try:
+            media_id = str(task.task_params[0][0])
+        except (IndexError, TypeError, KeyError):
+            continue
+        if media_id not in running_uuids:
+            continue
+        try:
+            media = Media.objects.get(pk=media_id)
+        except Media.DoesNotExist:
+            continue
+        elapsed = None
+        if task.start_at:
+            elapsed = int((timezone.now() - task.start_at).total_seconds())
+        return dict(
+            active=True,
+            media_key=media.key,
+            media_name=media.name,
+            elapsed_seconds=elapsed,
+        )
+    return dict(active=False)
+
+
 def get_running_tasks_by_name(arg_str, instance_id, /):
     name = arg_str
     if '.' not in name:

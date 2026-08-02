@@ -67,6 +67,15 @@
           (no task actually running for them; cleared automatically every 10 minutes)
         {% endif %}
       </span>
+      <span class="collection-item">
+        <i class="fas fa-download"></i>
+        {% if download_progress.active %}
+          Downloading <strong>{{ download_progress.media_name }}</strong>
+          ({{ download_progress.elapsed_seconds|intcomma }}s so far)
+        {% else %}
+          No download currently in progress
+        {% endif %}
+      </span>
       {% for p in ffmpeg_status %}
       <span class="collection-item">
         <i class="fas fa-film"></i> {{ p.comm }} (pid {{ p.pid }}):
