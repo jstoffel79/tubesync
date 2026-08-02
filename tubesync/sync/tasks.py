@@ -989,8 +989,21 @@ def index_source(source_id):
     '''
     db.reset_queries()
     cleanup_completed_tasks()
-    # deleting expired media should happen any time an index task is requested
-    cleanup_old_media()
+    # deleting expired media should happen any time an index task is requested.
+    # cleanup_old_media is a @db_task -- calling it bare enqueues a *separate*
+    # async task on the filesystem queue rather than running it here, so
+    # indexing N sources back-to-back enqueued N independent, full-table (not
+    # scoped to the current source) cleanup passes. With 2 filesystem workers,
+    # two of those could run concurrently and race on deleting the same
+    # expired row: one deletes it while the other's pre_delete signal handler
+    # (media_pre_delete) tries to .save() its now-gone in-memory copy, which
+    # Django resolves as an INSERT fallback -- colliding with the
+    # (source_id, key) unique constraint. Reproduced live in production
+    # (psycopg.errors.UniqueViolation on sync_media_source_id_key) while
+    # enabling several sources at once. call_local() runs it synchronously,
+    # inline, on this already-serialized 'limited' queue worker instead,
+    # which is what the comment above always intended.
+    cleanup_old_media.call_local()
     try:
         source = Source.objects.get(pk=source_id)
     except Source.DoesNotExist as e:
