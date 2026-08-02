@@ -661,6 +661,21 @@ def get_throttle_status():
     return dict(cooling=cooling, remaining_seconds=int(remaining))
 
 
+def get_pod_info():
+    '''
+        Surfaces which pod/node is actually serving this page, via
+        kubernetes' Downward API (env vars populated from fieldRef in the
+        Deployment spec). Outside kubernetes -- e.g. local dev -- these env
+        vars are simply unset and the fields render blank.
+    '''
+    import os
+    return dict(
+        pod_name=os.environ.get('POD_NAME', ''),
+        pod_ip=os.environ.get('POD_IP', ''),
+        node_name=os.environ.get('NODE_NAME', ''),
+    )
+
+
 @db_periodic_task(
     huey_crontab(minute=40, strict=True,),
     priority=100,
@@ -1477,19 +1492,50 @@ def on_complete_download_media_image(signal_name, task_obj, exception_obj=None, 
     if result is False or result is True:
         huey.result(preserve=False, id=task_obj.id)
 
+def _download_media_in_subprocess(media_id, override, result_queue):
+    '''
+        Runs Media.download_media() in a forked child process. This exists
+        because huey's `timeout=` for the process worker environment is
+        enforced via SIGALRM *inside the same process running the task*
+        (huey.utils.process_timeout). /downloads is a `hard` NFS4 mount --
+        when the NAS is slow/unreachable, ffmpeg (remux/keyframe
+        postprocessing) or yt-dlp's own file I/O against that mount blocks
+        in the kernel's TASK_KILLABLE state. SIGALRM is not a fatal signal,
+        so it is never delivered while the task is stuck there, and huey's
+        timeout silently never fires -- this was verified by reading huey's
+        actual source (huey/utils.py: process_timeout uses signal.SIGALRM;
+        huey/consumer.py: Worker.loop calls huey.execute() in its own
+        process, with no separate monitor process to kill it externally).
+        TASK_KILLABLE, unlike plain D-state, *does* honor SIGKILL/SIGTERM --
+        so running the actual download in a child process lets the parent
+        enforce a real wall-clock deadline with `Process.kill()`, which
+        works even while the child is stuck in NFS I/O.
+
+        Runs in a forked child (Linux only) so Django's app registry is
+        already loaded. Inherited DB connections are explicitly closed
+        first, same reasoning as `_index_media_in_subprocess`.
+    '''
+    db.connections.close_all()
+    try:
+        media = Media.objects.get(pk=media_id)
+        result_queue.put(('ok', media.download_media()))
+    except Exception as e:
+        result_queue.put(('error', e))
+
+
 @db_task(
     delay=60, priority=70, queue=Val(TaskQueue.LIMIT),
     retries=3, retry_delay=300,
-    # The 'limited' queue runs a single *process* worker, so a hang here
-    # (e.g. a stuck ffmpeg subprocess during remux/keyframe postprocessing)
-    # blocks every other download indefinitely, with no automatic
-    # recovery -- this happened in production and required manually
-    # killing the pod and clearing an orphaned media:{uuid} lock by hand.
-    # `timeout` is enforced by huey at the process level: if exceeded, the
-    # worker process is killed and respawned, restoring queue throughput
-    # even though this specific attempt failed. Generous (3h) since large
-    # 4K downloads/remuxes can legitimately run long.
-    timeout=3*60*60,
+    # This used to also set `timeout=3*60*60` to guard against a stuck
+    # ffmpeg/NFS hang here wedging the single-process 'limited' worker
+    # forever. That guard does not actually work (see
+    # `_download_media_in_subprocess`'s docstring) -- huey's SIGALRM-based
+    # timeout cannot interrupt the TASK_KILLABLE NFS wait it exists to
+    # guard against. The real enforcement now happens via the subprocess
+    # deadline below, so huey's own `timeout` is left unset here: it would
+    # only add a second, non-functional layer for this specific hang, and
+    # for genuinely slow-but-progressing large 4K downloads/remuxes there
+    # is no good universal huey-level timeout value anyway.
 )
 def download_media_file(media_id, override=False):
     '''
@@ -1524,7 +1570,37 @@ def download_media_file(media_id, override=False):
         container = format_str = None
         log.info(f'Downloading media: {media} (UUID: {media.pk}) to: "{filepath}"')
         try:
-            format_str, container = media.download_media()
+            import multiprocessing
+            ctx = multiprocessing.get_context('fork')
+            result_queue = ctx.Queue()
+            proc = ctx.Process(
+                target=_download_media_in_subprocess,
+                args=(media_id, override, result_queue),
+                daemon=True,
+            )
+            proc.start()
+            # Wall-clock deadline enforced from OUTSIDE the process doing
+            # the actual I/O -- this is what lets us SIGKILL a download
+            # that's genuinely wedged in NFS I/O (see docstring above).
+            proc.join(timeout=3*60*60)
+            if proc.is_alive():
+                log.error(f'download_media_file: subprocess for {media.key} '
+                          f'exceeded deadline, killing it (pid {proc.pid})')
+                proc.kill()
+                proc.join(timeout=30)
+                raise DownloadFailedException(
+                    f'Downloading media {media} (UUID: {media.pk}) timed out '
+                    f'and the download subprocess had to be killed'
+                )
+            if result_queue.empty():
+                raise DownloadFailedException(
+                    f'Download subprocess for {media} (UUID: {media.pk}) '
+                    f'exited without a result (exit code {proc.exitcode})'
+                )
+            status, payload = result_queue.get()
+            if status == 'error':
+                raise payload
+            format_str, container = payload
         except FormatUnavailableError as e:
             media.failed_format(e.format, cause=e.exc, exc=e)
             raise CancelExecution(_('format did not work'), retry=True) from e.__cause__
