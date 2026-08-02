@@ -27,7 +27,7 @@ from common.huey import CancelExecution, dynamic_retry, register_huey_signals
 from common.logger import log
 from common.models import TaskHistory
 from common.errors import (
-    DownloadFailedException, FormatUnavailableError,
+    DownloadFailedException,
     NoFormatException, NoMediaException, NoThumbnailException,
     QuerySetEmptyError,
 )
@@ -918,35 +918,6 @@ def migrate_to_metadata(media_id):
     migrating_lock.acquired = False
 
 
-def _index_media_in_subprocess(source_id):
-    '''
-        Runs Source.index_media() in a forked child process and returns
-        its result. yt-dlp's extract_flat call for a channel/playlist tab
-        materializes the full entry list in memory before returning it --
-        for very large channels (~6700 videos) this has been measured to
-        peak around 3.3GB (meeb/tubesync#933/#955), even after upstream's
-        fix. Previously this was mitigated by capping TUBESYNC_WORKERS to
-        1, which throttles *all* task types (downloads, metadata,
-        thumbnails), not just indexing.
-
-        Running this specific call in a short-lived child process instead
-        confines that peak RSS to the child's own address space -- the OS
-        reclaims all of it the moment the child exits, so the long-lived
-        Huey worker process's own memory footprint stays flat regardless
-        of channel size. This is what actually lets TUBESYNC_WORKERS be
-        raised again for real concurrency elsewhere.
-
-        Runs in a *forked* child (Linux only), so Django's app registry is
-        already loaded -- no django.setup() needed. Inherited DB
-        connections are explicitly closed first: forking duplicates open
-        socket file descriptors, and sharing a live DB connection across
-        two processes is undefined behavior.
-    '''
-    db.connections.close_all()
-    source = Source.objects.get(pk=source_id)
-    return source.index_media()
-
-
 @db_task(delay=30, priority=80, queue=Val(TaskQueue.LIMIT))
 def index_source(source_id):
     '''
@@ -978,11 +949,34 @@ def index_source(source_id):
     source.has_failed = False
     # Index the source in an isolated child process so yt-dlp's peak
     # memory usage for very large channels doesn't accumulate in this
-    # long-lived worker process.
-    import multiprocessing
-    ctx = multiprocessing.get_context('fork')
-    with ctx.Pool(processes=1, maxtasksperchild=1) as pool:
-        videos = pool.apply(_index_media_in_subprocess, (source_id,))
+    # long-lived worker process. A real OS subprocess, not
+    # multiprocessing.Pool/Process: huey's own process-pool workers are
+    # themselves daemonic (huey/consumer.py sets p.daemon = True), and
+    # daemonic processes are forbidden from having multiprocessing children
+    # (AssertionError, confirmed in production via the equivalent bug in
+    # download_media_file). subprocess.Popen has no such restriction.
+    import json
+    import subprocess
+    import sys
+    proc = subprocess.run(
+        [sys.executable, 'manage.py', 'index_media_worker', str(source_id)],
+        cwd='/app',
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if not proc.stdout.strip():
+        raise NoMediaException(
+            f'Source "{source}" (ID: {source_id}) indexing subprocess exited '
+            f'without a result (exit code {proc.returncode}): {proc.stderr}'
+        )
+    payload = json.loads(proc.stdout)
+    if payload['status'] == 'error':
+        raise NoMediaException(
+            f'Source "{source}" (ID: {source_id}) indexing subprocess failed: '
+            f'{payload.get("message")}'
+        )
+    videos = queue(payload['videos'])
     if not videos:
         source.has_failed = True
         update_model(source, has_failed=source.has_failed)
@@ -1492,37 +1486,6 @@ def on_complete_download_media_image(signal_name, task_obj, exception_obj=None, 
     if result is False or result is True:
         huey.result(preserve=False, id=task_obj.id)
 
-def _download_media_in_subprocess(media_id, override, result_queue):
-    '''
-        Runs Media.download_media() in a forked child process. This exists
-        because huey's `timeout=` for the process worker environment is
-        enforced via SIGALRM *inside the same process running the task*
-        (huey.utils.process_timeout). /downloads is a `hard` NFS4 mount --
-        when the NAS is slow/unreachable, ffmpeg (remux/keyframe
-        postprocessing) or yt-dlp's own file I/O against that mount blocks
-        in the kernel's TASK_KILLABLE state. SIGALRM is not a fatal signal,
-        so it is never delivered while the task is stuck there, and huey's
-        timeout silently never fires -- this was verified by reading huey's
-        actual source (huey/utils.py: process_timeout uses signal.SIGALRM;
-        huey/consumer.py: Worker.loop calls huey.execute() in its own
-        process, with no separate monitor process to kill it externally).
-        TASK_KILLABLE, unlike plain D-state, *does* honor SIGKILL/SIGTERM --
-        so running the actual download in a child process lets the parent
-        enforce a real wall-clock deadline with `Process.kill()`, which
-        works even while the child is stuck in NFS I/O.
-
-        Runs in a forked child (Linux only) so Django's app registry is
-        already loaded. Inherited DB connections are explicitly closed
-        first, same reasoning as `_index_media_in_subprocess`.
-    '''
-    db.connections.close_all()
-    try:
-        media = Media.objects.get(pk=media_id)
-        result_queue.put(('ok', media.download_media()))
-    except Exception as e:
-        result_queue.put(('error', e))
-
-
 @db_task(
     delay=60, priority=70, queue=Val(TaskQueue.LIMIT),
     retries=3, retry_delay=300,
@@ -1570,43 +1533,60 @@ def download_media_file(media_id, override=False):
         container = format_str = None
         log.info(f'Downloading media: {media} (UUID: {media.pk}) to: "{filepath}"')
         try:
-            import multiprocessing
-            ctx = multiprocessing.get_context('fork')
-            result_queue = ctx.Queue()
-            proc = ctx.Process(
-                target=_download_media_in_subprocess,
-                args=(media_id, override, result_queue),
-                daemon=True,
+            import json
+            import subprocess
+            import sys
+            # A real OS subprocess, not multiprocessing.Process: huey's own
+            # process-pool workers are themselves daemonic (huey/consumer.py
+            # sets p.daemon = True), and daemonic processes are forbidden
+            # from having multiprocessing children (asserted in
+            # multiprocessing/process.py) -- confirmed by reproducing
+            # `AssertionError: daemonic processes are not allowed to have
+            # children` in production. subprocess.Popen has no such
+            # restriction, and still lets us enforce a real wall-clock
+            # deadline with Popen.kill() (SIGKILL) from outside the process
+            # doing the actual I/O -- which is what's needed here, since
+            # /downloads is a `hard` NFS4 mount and ffmpeg/yt-dlp file I/O
+            # against it can block in the kernel's TASK_KILLABLE state,
+            # which SIGALRM (huey's own `timeout=`) cannot interrupt but
+            # SIGKILL can.
+            proc = subprocess.Popen(
+                [sys.executable, 'manage.py', 'download_media_worker', str(media_id)],
+                cwd='/app',
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
             )
-            proc.start()
-            # Wall-clock deadline enforced from OUTSIDE the process doing
-            # the actual I/O -- this is what lets us SIGKILL a download
-            # that's genuinely wedged in NFS I/O (see docstring above).
-            proc.join(timeout=3*60*60)
-            if proc.is_alive():
+            try:
+                stdout, stderr = proc.communicate(timeout=3*60*60)
+            except subprocess.TimeoutExpired:
                 log.error(f'download_media_file: subprocess for {media.key} '
                           f'exceeded deadline, killing it (pid {proc.pid})')
                 proc.kill()
-                proc.join(timeout=30)
+                stdout, stderr = proc.communicate(timeout=30)
                 raise DownloadFailedException(
                     f'Downloading media {media} (UUID: {media.pk}) timed out '
                     f'and the download subprocess had to be killed'
                 )
-            if result_queue.empty():
+            if not stdout.strip():
                 raise DownloadFailedException(
                     f'Download subprocess for {media} (UUID: {media.pk}) '
-                    f'exited without a result (exit code {proc.exitcode})'
+                    f'exited without a result (exit code {proc.returncode}): {stderr}'
                 )
-            status, payload = result_queue.get()
-            if status == 'error':
-                raise payload
-            format_str, container = payload
-        except FormatUnavailableError as e:
-            media.failed_format(e.format, cause=e.exc, exc=e)
-            raise CancelExecution(_('format did not work'), retry=True) from e.__cause__
-        except YouTubeError as e:
-            throttle_record_error(str(e))
-            raise
+            payload = json.loads(stdout)
+            if payload['status'] == 'error':
+                category = payload.get('category')
+                if category == 'format_unavailable':
+                    media.failed_format(payload.get('format'))
+                    raise CancelExecution(_('format did not work'), retry=True)
+                elif category == 'youtube_error':
+                    throttle_record_error(payload.get('message', ''))
+                    raise YouTubeError(payload.get('message', ''))
+                elif category == 'no_format':
+                    raise NoFormatException(payload.get('message', ''))
+                else:
+                    raise DownloadFailedException(payload.get('message', 'unknown subprocess error'))
+            format_str, container = payload['format_str'], payload['container']
         except NoFormatException:
             # Try refreshing formats
             if media.has_metadata:
