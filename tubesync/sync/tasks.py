@@ -262,6 +262,64 @@ def get_cgroup_status():
         pass
     return status
 
+
+def get_ffmpeg_status():
+    '''
+        Live view of any ffmpeg/ffprobe processes actually running in this
+        container right now, with accumulated CPU time. The Running task
+        list shows which video is being worked on and its last reported
+        progress label, but not whether ffmpeg itself is genuinely making
+        progress or has hung -- this is exactly how the earlier stuck
+        keyframe/remux postprocessing incident was diagnosed: by hand,
+        checking /proc for a live ffmpeg process and how much CPU time
+        it had accumulated. Surfacing it here means that check no longer
+        requires a shell into the pod.
+    '''
+    processes = []
+    try:
+        clock_ticks = os.sysconf('SC_CLK_TCK')
+    except (ValueError, OSError):
+        clock_ticks = 100
+    try:
+        proc_entries = list(Path('/proc').iterdir())
+    except OSError:
+        return processes
+    for entry in proc_entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            comm = (entry / 'comm').read_text().strip()
+        except OSError:
+            continue
+        if comm not in ('ffmpeg', 'ffprobe'):
+            continue
+        cpu_seconds = None
+        try:
+            stat_fields = (entry / 'stat').read_text().rsplit(')', 1)[1].split()
+            cpu_seconds = round((int(stat_fields[11]) + int(stat_fields[12])) / clock_ticks, 1)
+        except (OSError, IndexError, ValueError):
+            pass
+        target = None
+        try:
+            cmdline = [
+                c for c in (entry / 'cmdline').read_bytes().decode(errors='replace').split('\x00')
+                if c
+            ]
+            if cmdline:
+                # last arg is almost always the output path/filename for
+                # how tubesync invokes ffmpeg -- good enough for an
+                # at-a-glance "what is this working on"
+                target = cmdline[-1]
+        except OSError:
+            pass
+        processes.append(dict(
+            pid=entry.name,
+            comm=comm,
+            cpu_seconds=cpu_seconds,
+            target=target,
+        ))
+    return processes
+
 def get_running_tasks_by_name(arg_str, instance_id, /):
     name = arg_str
     if '.' not in name:
@@ -320,6 +378,73 @@ def update_model(instance, **kwargs):
     return qs.filter(
         pk=instance.pk,
     ).update(**kwargs)
+
+
+_container_start_time_cache = None
+
+
+def get_container_start_time():
+    '''
+        Wall-clock time this container's PID 1 started -- a hard,
+        unambiguous signal distinct from any elapsed-time heuristic.
+
+        Why this matters: on 2026-08-01, tubesync was evicted and
+        rescheduled to a different node mid-download (a stuck Longhorn
+        volume attachment). The old pod was killed non-gracefully, so
+        several media:{uuid} locks and their TaskHistory "running" rows
+        were left behind in Postgres (which survives across pods) with
+        no process anywhere left to ever complete or release them --
+        but they still looked "running" by any purely elapsed-time
+        check, since their start_at was within the trust window.
+        Comparing a lock's start_at against *this container's own start
+        time* catches that case unconditionally: nothing from a previous
+        pod generation ever ran in the current container. Cached because
+        PID 1 cannot be replaced without the whole container restarting.
+    '''
+    global _container_start_time_cache
+    if _container_start_time_cache is not None:
+        return _container_start_time_cache
+    try:
+        clock_ticks = os.sysconf('SC_CLK_TCK')
+        with open('/proc/uptime') as f:
+            uptime = float(f.read().split()[0])
+        boot_time = time.time() - uptime
+        with open('/proc/1/stat') as f:
+            fields = f.read().rsplit(')', 1)[1].split()
+        starttime_ticks = int(fields[19])
+        _container_start_time_cache = boot_time + (starttime_ticks / clock_ticks)
+    except (OSError, ValueError, IndexError):
+        _container_start_time_cache = None
+    return _container_start_time_cache
+
+
+def get_genuinely_running_uuids(lock_stale_after):
+    '''
+        Media/Source UUIDs with a TaskHistory row that both (a) satisfies
+        the "running" convention within `lock_stale_after` seconds, and
+        (b) didn't start before this container itself did -- see
+        get_container_start_time() for why (b) matters. Shared by
+        clear_stale_media_locks() (acts on this) and get_lock_status()
+        (just reports it, for the Tasks page).
+    '''
+    container_start = get_container_start_time()
+    running_uuids = set()
+    qs = TaskHistory.objects.running(within=lock_stale_after).values_list(
+        'task_params', 'start_at',
+    )
+    for params, start_at in qs:
+        if container_start is not None and start_at is not None:
+            if start_at.timestamp() < container_start:
+                # orphaned by a pod/container generation change -- not
+                # really running, no matter how "fresh" it looks.
+                continue
+        try:
+            args = params[0]
+            if args:
+                running_uuids.add(str(args[0]))
+        except (IndexError, TypeError, KeyError):
+            continue
+    return running_uuids
 
 
 @db_periodic_task(
@@ -384,23 +509,43 @@ def clear_stale_media_locks():
         (see huey.api.TaskLock), so staleness can't be judged from the
         lock alone. Instead, cross-reference every currently-held
         media/index_media lock against TaskHistory (which IS timestamped)
-        for a task that's actually still running against that UUID within
-        MAX_RUN_TIME; a lock with no such running task backing it is
-        orphaned and safe to clear.
+        for a task that's actually still running against that UUID.
+
+        Uses LOCK_STALE_AFTER_SECONDS (default 3h), not MAX_RUN_TIME
+        (12h) -- MAX_RUN_TIME is tuned for the Tasks page's "Running"
+        display, where it's fine to keep showing a legitimately
+        long-running download as running for most of a day. But that
+        same generous window made this sweeper *itself* useless: seen
+        in production, huey worker processes restarted while a handful
+        of media:{uuid} locks were held; the owning tasks were dead, but
+        their TaskHistory rows still satisfied the 12h "running" check,
+        so this function saw them as running_uuids and refused to touch
+        their locks, requiring the exact manual diagnosis this function
+        exists to avoid. A single video's download+transcode essentially
+        never legitimately takes 3h, so this is a much more meaningful
+        trust window for "is this lock's owner still plausibly alive" --
+        and on top of that, get_genuinely_running_uuids() also discards
+        anything that started before this container itself did (see
+        get_container_start_time()), which is what actually would have
+        caught the 2026-08-01 pod-eviction incident regardless of window
+        size.
+
+        Clearing the lock alone isn't enough to actually recover, though:
+        huey has no mechanism to notice "the worker executing this task
+        died" and requeue it -- the lock's orphaned owner had already
+        been dequeued, so it's simply gone, and the media is left
+        permanently un-downloaded until something else happens to notice.
+        So for each orphaned lock, also explicitly reschedule the
+        underlying work if it still needs doing.
     '''
     from django_huey import DJANGO_HUEY, get_queue, lock_task
 
-    running_uuids = set()
-    for params in get_running_tasks().values_list('task_params', flat=True):
-        try:
-            args = params[0]
-            if args:
-                running_uuids.add(str(args[0]))
-        except (IndexError, TypeError, KeyError):
-            continue
+    lock_stale_after = getattr(settings, 'LOCK_STALE_AFTER_SECONDS', 3 * 60 * 60)
+    running_uuids = get_genuinely_running_uuids(lock_stale_after)
 
     lock_prefixes = ('media:', 'index_media:')
     cleared = 0
+    rescheduled = 0
     for qn in DJANGO_HUEY.get('queues', dict()):
         q = get_queue(qn)
         try:
@@ -422,9 +567,95 @@ def clear_stale_media_locks():
                 cleared += 1
                 log.warning(f'clear_stale_media_locks: cleared orphaned lock: '
                             f'{lock_name} (queue={qn})')
+                if prefix == 'media:':
+                    try:
+                        media = Media.objects.get(pk=lock_uuid)
+                    except (Media.DoesNotExist, ValueError):
+                        break
+                    if not media.downloaded and not media.manual_skip:
+                        TaskHistory.schedule(
+                            download_media_file,
+                            str(media.pk),
+                            remove_duplicates=True,
+                            vn_fmt=_('Downloading media for "{}" (recovered after an orphaned lock)'),
+                            vn_args=(media.name,),
+                        )
+                        rescheduled += 1
+                        log.warning(f'clear_stale_media_locks: rescheduled download for '
+                                    f'orphaned media: {media.key}')
+                elif prefix == 'index_media:':
+                    try:
+                        media = Media.objects.get(pk=lock_uuid)
+                    except (Media.DoesNotExist, ValueError):
+                        break
+                    still_pending = Metadata.objects.filter(
+                        media__isnull=True, source=media.source, key=media.key,
+                    ).exists()
+                    if still_pending:
+                        TaskHistory.schedule(
+                            migrate_to_metadata,
+                            str(media.pk),
+                            remove_duplicates=True,
+                            vn_fmt=_('Migrating metadata for "{}" (recovered after an orphaned lock)'),
+                            vn_args=(media.name,),
+                        )
+                        rescheduled += 1
+                        log.warning(f'clear_stale_media_locks: rescheduled metadata migration for '
+                                    f'orphaned media: {media.key}')
                 break
     if cleared:
-        log.warning(f'clear_stale_media_locks: cleared {cleared} orphaned lock(s)')
+        log.warning(f'clear_stale_media_locks: cleared {cleared} orphaned lock(s), '
+                    f'rescheduled {rescheduled} task(s)')
+
+
+def get_lock_status():
+    '''
+        Read-only version of the same check clear_stale_media_locks() acts
+        on, for the Tasks page: how many media/index_media locks are
+        currently held, and how many of those don't have a genuinely
+        running task backing them right now (the same orphan signal,
+        including the container-generation check). A non-zero
+        `orphaned` here means something is stuck -- either waiting for
+        the next sweep (it runs every 10 minutes) or, if this stays
+        nonzero across repeated checks, something to look into directly.
+    '''
+    from django_huey import DJANGO_HUEY, get_queue
+
+    lock_stale_after = getattr(settings, 'LOCK_STALE_AFTER_SECONDS', 3 * 60 * 60)
+    running_uuids = get_genuinely_running_uuids(lock_stale_after)
+
+    held = 0
+    orphaned = 0
+    for qn in DJANGO_HUEY.get('queues', dict()):
+        q = get_queue(qn)
+        try:
+            rows = q.storage.sql('select key from kv', results=True)
+        except Exception as e:
+            log.warning(f'get_lock_status: could not read lock storage for queue {qn}: {e}')
+            continue
+        for (key,) in rows:
+            if not isinstance(key, str) or '.lock.' not in key:
+                continue
+            _, _, lock_name = key.partition('.lock.')
+            if not (lock_name.startswith('media:') or lock_name.startswith('index_media:')):
+                continue
+            held += 1
+            lock_uuid = lock_name.split(':', 1)[1]
+            if lock_uuid not in running_uuids:
+                orphaned += 1
+    return dict(held=held, orphaned=orphaned)
+
+
+def get_throttle_status():
+    '''
+        Surfaces sync.throttle's cooldown state (see meeb/tubesync#1529)
+        on the Tasks page directly -- so "why has nothing downloaded in
+        a while" can be answered by looking at the page instead of
+        having to know this module exists and query it by hand.
+    '''
+    from .throttle import in_cooldown
+    cooling, remaining = in_cooldown()
+    return dict(cooling=cooling, remaining_seconds=int(remaining))
 
 
 @db_periodic_task(

@@ -22,7 +22,8 @@ from ..forms import ScheduleTaskForm
 from ..tasks import (
     get_task_map, map_tasks_to_instances, get_error_message,
     get_running_tasks, check_source_directory_exists,
-    get_queue_status, get_cgroup_status,
+    get_queue_status, get_cgroup_status, get_ffmpeg_status,
+    get_lock_status, get_throttle_status,
 )
 
 
@@ -114,6 +115,9 @@ class TasksView(ListView):
         data['wait_for_database_queue'] = False
         data['queue_status'] = get_queue_status()
         data['cgroup_status'] = get_cgroup_status()
+        data['ffmpeg_status'] = get_ffmpeg_status()
+        data['lock_status'] = get_lock_status()
+        data['throttle_status'] = get_throttle_status()
 
         # Collect every task we might render up front so the Source/Media
         # instances they point at can be fetched in one batched query per

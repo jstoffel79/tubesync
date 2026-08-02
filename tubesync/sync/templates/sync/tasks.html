@@ -43,6 +43,32 @@
       {% empty %}
       <span class="collection-item no-items"><i class="fas fa-info-circle"></i> Queue status is unavailable.</span>
       {% endfor %}
+      <span class="collection-item{% if throttle_status.cooling %} error-text{% endif %}">
+        <i class="fas fa-hourglass-half"></i>
+        {% if throttle_status.cooling %}
+          <strong>Paused for throttling/rate limits</strong> -- resuming in
+          {{ throttle_status.remaining_seconds|intcomma }}s
+        {% else %}
+          Not currently rate-limited/throttled
+        {% endif %}
+      </span>
+      <span class="collection-item{% if lock_status.orphaned %} error-text{% endif %}">
+        <i class="fas fa-lock"></i>
+        Media locks held: <strong>{{ lock_status.held|default:"0" }}</strong>
+        {% if lock_status.orphaned %}
+          -- <strong>{{ lock_status.orphaned }} look orphaned</strong>
+          (no task actually running for them; cleared automatically every 10 minutes)
+        {% endif %}
+      </span>
+      {% for p in ffmpeg_status %}
+      <span class="collection-item">
+        <i class="fas fa-film"></i> {{ p.comm }} (pid {{ p.pid }}):
+        {% if p.cpu_seconds %}{{ p.cpu_seconds }}s CPU time so far{% endif %}
+        {% if p.target %}<br><small>{{ p.target }}</small>{% endif %}
+      </span>
+      {% empty %}
+      <span class="collection-item no-items"><i class="fas fa-info-circle"></i> No ffmpeg/ffprobe process is currently running.</span>
+      {% endfor %}
     </div>
   </div>
 </div>
