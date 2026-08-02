@@ -65,6 +65,13 @@
           Not currently rate-limited/throttled
         {% endif %}
       </span>
+      {% if queue_activity %}
+      <span class="collection-item">
+        <i class="fas fa-satellite-dish"></i> yt-dlp concurrency:
+        <strong>limited</strong> (index/download/upgrade): {% if queue_activity.limited_busy %}busy{% else %}idle{% endif %},
+        <strong>network</strong> (format-refresh/metadata, shared lock): {% if queue_activity.yt_dlp_aux_busy %}busy{% else %}idle{% endif %}
+      </span>
+      {% endif %}
       <span class="collection-item{% if lock_status.orphaned %} error-text{% endif %}">
         <i class="fas fa-lock"></i>
         Media locks held: <strong>{{ lock_status.held|default:"0" }}</strong>

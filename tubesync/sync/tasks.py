@@ -752,6 +752,37 @@ def get_throttle_status():
     return dict(cooling=cooling, remaining_seconds=int(remaining))
 
 
+def get_queue_activity():
+    '''
+        Per-queue "is a yt-dlp/YouTube call actually in flight right now"
+        status, for the Tasks page. There is no literal per-queue rate
+        limit in this app -- sync.throttle's cooldown (get_throttle_status)
+        is global, since YouTube doesn't care which internal queue made a
+        request. What IS meaningfully per-queue is concurrency: 'limited'
+        (index_source/download_media_file/upgrade_media) enforces one
+        yt-dlp call at a time via its single worker, and the separate
+        'yt_dlp_aux_call' lock (refresh_formats/download_media_metadata,
+        moved off 'limited' onto 'network' to stop a huge backlog of one
+        from crowding out the other) enforces a second, independent "one
+        at a time" -- so at most two yt-dlp calls can be in flight
+        cluster-wide. Showing whether each is currently busy makes that
+        concurrency model visible instead of implicit.
+    '''
+    from django_huey import lock_task as _lock_task
+    limited_running = TaskHistory.objects.running(within=3*60*60).filter(
+        name__in=(
+            'sync.tasks.index_source',
+            'sync.tasks.download_media_file',
+            'sync.tasks.upgrade_media',
+        ),
+    ).exists()
+    aux_lock = _lock_task('sync.tasks.yt_dlp_aux_call.serial', queue=Val(TaskQueue.NET))
+    return dict(
+        limited_busy=limited_running,
+        yt_dlp_aux_busy=aux_lock.is_locked(),
+    )
+
+
 def get_pod_info():
     '''
         Surfaces which pod/node is actually serving this page, via
@@ -1405,10 +1436,20 @@ def upgrade_media(media_id):
             raise CancelExecution(_('downloaded media is better'))
         download_media_file.call_local(str(media.pk), override=True)
 
-@db_task(delay=60, priority=60, retries=3, retry_delay=600, queue=Val(TaskQueue.LIMIT))
+@db_task(delay=60, priority=60, retries=3, retry_delay=600, queue=Val(TaskQueue.NET))
+@huey_lock_task('sync.tasks.yt_dlp_aux_call.serial', queue=Val(TaskQueue.NET))
 def download_media_metadata(media_id):
     '''
         Downloads the metadata for a media item.
+
+        Runs on 'network' (shared 'yt_dlp_aux_call' serialization lock
+        with refresh_formats) rather than 'limited' (download_media_file's
+        single-worker queue) for the same reason refresh_formats was
+        moved: 28,799 pending metadata fetches were crowding out actual
+        video downloads for the same single worker. Still capped to one
+        at a time (via the shared lock) so this doesn't add a second
+        concurrent yt-dlp call against YouTube alongside whatever
+        'limited' is doing.
     '''
     try:
         media = Media.objects.get(pk=media_id)
@@ -1752,8 +1793,28 @@ def rescan_media_server(mediaserver_id):
     mediaserver.update()
 
 
-@dynamic_retry(db_task, backoff_func=lambda n: (n*3600)+600, priority=50, retries=15, queue=Val(TaskQueue.LIMIT))
+@dynamic_retry(db_task, backoff_func=lambda n: (n*3600)+600, priority=50, retries=15, queue=Val(TaskQueue.NET))
+@huey_lock_task('sync.tasks.yt_dlp_aux_call.serial', queue=Val(TaskQueue.NET))
 def refresh_formats(media_id):
+    '''
+        Runs on the 'network' queue (which has multiple workers) rather
+        than 'limited' (download_media_file's single-worker queue) so a
+        large backlog of format-refreshes -- e.g. proactively scheduled
+        for every can_download=False video by save_all_media_for_source
+        after indexing several large sources at once -- doesn't crowd
+        out actual video downloads for the same single worker. Reproduced
+        in production: 177k pending refresh_formats vs 17 pending
+        download_media_file, both competing for one worker, at ~48s per
+        refresh_formats call (~98 days to drain before downloads would
+        get a fair share).
+
+        Still serialized to exactly one at a time via huey_lock_task
+        (not truly concurrent even though 'network' has several worker
+        threads) so this doesn't start hammering YouTube with parallel
+        format-list requests -- preserving the same "one yt-dlp call
+        against YouTube at a time" property 'limited' existed for, just
+        without sharing a worker with downloads specifically.
+    '''
     try:
         media = Media.objects.get(pk=media_id)
     except Media.DoesNotExist as e:
