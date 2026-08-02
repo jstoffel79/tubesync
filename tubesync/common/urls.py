@@ -2,7 +2,10 @@ from django.conf import settings
 from django.urls import path
 from django.views.generic.base import RedirectView
 from django.http import HttpResponse
-from .views import error403, error404, error500, HealthCheckView
+from .views import (
+    error403, error404, error500,
+    HealthCheckView, LivenessView, ReadinessView,
+)
 
 
 app_name = 'common'
@@ -36,5 +39,13 @@ urlpatterns = [
     path('healthcheck',
         HealthCheckView.as_view(),
         name='healthcheck'),
+
+    path('healthz/live',
+        LivenessView.as_view(),
+        name='healthz-live'),
+
+    path('healthz/ready',
+        ReadinessView.as_view(),
+        name='healthz-ready'),
 
 ]
