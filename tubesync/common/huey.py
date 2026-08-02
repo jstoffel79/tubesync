@@ -552,7 +552,18 @@ def prune_task_history(q, /, *, max_age=datetime.timedelta(days=7)):
     return pruned
 
 
-def register_huey_signals():
+def register_huey_signals(on_worker_startup=None):
+    '''
+        `on_worker_startup`, if given, is called once per queue via huey's
+        own on_startup() hook -- which only fires in actual consumer/worker
+        processes (`manage.py djangohuey --queue ...`), not in gunicorn web
+        workers that merely import this module. This is the right place
+        for "recover any state left behind by an ungracefully-killed
+        previous pod" work: it runs the moment a fresh worker process comes
+        up, rather than waiting for that recovery's own periodic schedule
+        to happen to fire (which could be up to its full interval late,
+        e.g. up to 10 minutes for clear_stale_media_locks).
+    '''
     from django import db
     from django_huey import DJANGO_HUEY, get_queue, pre_execute, post_execute, signal
     def close_db(task, task_value=None, exception=None, /, *, huey=None):
@@ -580,4 +591,18 @@ def register_huey_signals():
 
         # clean up old history and results from storage
         prune_task_history(q)
+
+        if on_worker_startup is not None:
+            # If a huey TaskWrapper (@db_task/@db_periodic_task-decorated)
+            # is passed, calling it directly would enqueue() it as an
+            # async task rather than actually running it here -- and it
+            # has no __name__ for on_startup()'s default naming, since
+            # it's a TaskWrapper, not a plain function. call_local() runs
+            # the wrapped function synchronously instead, which is what a
+            # startup hook needs.
+            hook = getattr(on_worker_startup, 'call_local', on_worker_startup)
+            hook_name = getattr(on_worker_startup, '__name__', None) or getattr(
+                getattr(on_worker_startup, 'func', None), '__name__', 'on_worker_startup',
+            )
+            q.on_startup(name=hook_name)(hook)
 

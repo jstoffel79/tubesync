@@ -41,7 +41,10 @@ from .youtube import YouTubeError
 
 atomic = db.transaction.atomic
 db_vendor = db.connection.vendor
-register_huey_signals()
+# register_huey_signals() is called at the bottom of this file instead of
+# here, passing clear_stale_media_locks as the worker on_startup hook --
+# it needs to be defined first, and this needs to run in worker processes
+# specifically (see register_huey_signals()'s own docstring).
 
 
 def get_task_map():
@@ -1791,5 +1794,13 @@ def delete_all_media_for_source(source_id, source_name, source_directory):
     if remove:
         log.info(f'Deleting directory for: {source_name}: {directory_path}')
         rmtree(directory_path, True)
+
+
+# Run once per worker process at startup (not in gunicorn web workers --
+# see register_huey_signals()'s docstring), so recovery from an
+# ungracefully-killed previous pod happens immediately on the new pod
+# coming up, instead of waiting for clear_stale_media_locks' own 10-minute
+# periodic schedule to happen to fire.
+register_huey_signals(on_worker_startup=clear_stale_media_locks)
 
 
