@@ -108,3 +108,80 @@ class ReadinessView(View):
                 healthy = False
         status = 200 if healthy else 503
         return JsonResponse({'status': 'ok' if healthy else 'error', 'checks': checks}, status=status)
+
+
+class MetricsView(View):
+    '''
+        Plain-text Prometheus exposition of the same figures already
+        computed for the Tasks page System Status panel (queue depths,
+        cgroup accounting, lock/throttle state, live ffmpeg processes) --
+        reusing those functions rather than a separate metrics-specific
+        code path, so this can never drift from what the UI shows. No auth/
+        IP firewall: scraped in-cluster only by the Prometheus Operator via
+        a ServiceMonitor, same trust boundary as the rest of the pod.
+    '''
+
+    def get(self, request, *args, **kwargs):
+        from sync.tasks import (
+            get_queue_status, get_cgroup_status, get_ffmpeg_status,
+            get_lock_status, get_throttle_status,
+        )
+        # name -> (help, type, [(labels_dict, value), ...])
+        metrics = {}
+
+        def sample(name, help_text, value, mtype='gauge', labels=None):
+            metrics.setdefault(name, (help_text, mtype, []))[2].append((labels or {}, value))
+
+        for q in get_queue_status():
+            sample('tubesync_queue_pending',
+                   'Tasks ready to run right now in this Huey queue.',
+                   q['pending'], labels={'queue': q['name']})
+            sample('tubesync_queue_scheduled',
+                   'Tasks scheduled for a future eta in this Huey queue.',
+                   q['scheduled'], labels={'queue': q['name']})
+
+        cgroup_status = get_cgroup_status()
+        if 'cpu_throttled_pct' in cgroup_status:
+            sample('tubesync_cpu_throttled_ratio',
+                   'Fraction of cgroup CPU accounting periods this container was throttled in.',
+                   cgroup_status['cpu_throttled_pct'] / 100)
+        if 'memory_current_mb' in cgroup_status:
+            sample('tubesync_memory_bytes',
+                   'Current cgroup memory usage in bytes.',
+                   int(cgroup_status['memory_current_mb'] * 1024 * 1024))
+        if 'memory_max_mb' in cgroup_status:
+            sample('tubesync_memory_limit_bytes',
+                   'Cgroup memory limit in bytes.',
+                   int(cgroup_status['memory_max_mb'] * 1024 * 1024))
+
+        sample('tubesync_ffmpeg_processes',
+               'Number of ffmpeg/ffprobe processes currently running in this container.',
+               len(get_ffmpeg_status()))
+
+        lock_status = get_lock_status()
+        sample('tubesync_locks_held', 'Media/index locks currently held.',
+               lock_status.get('held', 0))
+        sample('tubesync_locks_orphaned',
+               'Held locks with no genuinely running task backing them right now.',
+               lock_status.get('orphaned', 0))
+
+        throttle_status = get_throttle_status()
+        sample('tubesync_throttle_cooling',
+               'Whether downloads are currently paused for rate-limit cooldown.',
+               1 if throttle_status.get('cooling') else 0)
+        sample('tubesync_throttle_remaining_seconds',
+               'Seconds remaining in the current rate-limit cooldown, if any.',
+               throttle_status.get('remaining_seconds', 0))
+
+        lines = []
+        for name, (help_text, mtype, samples) in metrics.items():
+            lines.append(f'# HELP {name} {help_text}')
+            lines.append(f'# TYPE {name} {mtype}')
+            for labels, value in samples:
+                label_str = ''
+                if labels:
+                    pairs = ','.join(f'{k}="{v}"' for k, v in labels.items())
+                    label_str = '{' + pairs + '}'
+                lines.append(f'{name}{label_str} {value}')
+
+        return HttpResponse('\n'.join(lines) + '\n', content_type='text/plain; version=0.0.4')

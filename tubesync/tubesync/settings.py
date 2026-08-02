@@ -319,7 +319,7 @@ X_FRAME_OPTIONS = 'SAMEORIGIN'
 
 BASICAUTH_DISABLE = True
 BASICAUTH_REALM = 'Authenticate to TubeSync'
-BASICAUTH_ALWAYS_ALLOW_URIS = ('/healthcheck', '/healthz/live', '/healthz/ready')
+BASICAUTH_ALWAYS_ALLOW_URIS = ('/healthcheck', '/healthz/live', '/healthz/ready', '/metrics')
 BASICAUTH_USERS = {}
 
 

@@ -4,7 +4,7 @@ from django.views.generic.base import RedirectView
 from django.http import HttpResponse
 from .views import (
     error403, error404, error500,
-    HealthCheckView, LivenessView, ReadinessView,
+    HealthCheckView, LivenessView, ReadinessView, MetricsView,
 )
 
 
@@ -47,5 +47,9 @@ urlpatterns = [
     path('healthz/ready',
         ReadinessView.as_view(),
         name='healthz-ready'),
+
+    path('metrics',
+        MetricsView.as_view(),
+        name='metrics'),
 
 ]
