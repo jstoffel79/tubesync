@@ -22,6 +22,7 @@ from ..forms import ScheduleTaskForm
 from ..tasks import (
     get_task_map, map_tasks_to_instances, get_error_message,
     get_running_tasks, check_source_directory_exists,
+    get_queue_status, get_cgroup_status,
 )
 
 
@@ -111,6 +112,8 @@ class TasksView(ListView):
         data['scheduled'] = list()
         data['total_scheduled'] = scheduled_qs.count()
         data['wait_for_database_queue'] = False
+        data['queue_status'] = get_queue_status()
+        data['cgroup_status'] = get_cgroup_status()
 
         # Collect every task we might render up front so the Source/Media
         # instances they point at can be fetched in one batched query per

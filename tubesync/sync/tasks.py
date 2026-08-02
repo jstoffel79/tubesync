@@ -206,6 +206,62 @@ def get_running_tasks(arg_dt=None, /):
         within=timezone.timedelta(seconds=max_run_time),
     )
 
+
+def get_queue_status():
+    '''
+        Live depth of each Huey queue: how many tasks are ready to run right
+        now (pending) vs scheduled for a future eta. Used by the Tasks page
+        to show what's actually queued, distinct from TaskHistory (which is
+        historical bookkeeping, not the live queue state).
+    '''
+    from django_huey import DJANGO_HUEY, get_queue
+    queues = []
+    for qn in DJANGO_HUEY.get('queues', dict()):
+        try:
+            q = get_queue(qn)
+            queues.append(dict(
+                name=qn,
+                pending=q.pending_count(),
+                scheduled=q.scheduled_count(),
+            ))
+        except Exception as e:
+            log.warning(f'get_queue_status: could not read queue {qn}: {e}')
+    return queues
+
+
+def get_cgroup_status():
+    '''
+        Reads this container's own cgroup v2 accounting -- the same limits
+        Kubernetes actually enforces -- rather than generic host stats, so
+        the Tasks page reflects the real ceiling this pod is running under.
+        Returns an empty dict (rather than raising) on cgroup v1 hosts or
+        anywhere these files aren't present, so this is safe to call
+        unconditionally.
+    '''
+    status = {}
+    try:
+        stat_text = Path('/sys/fs/cgroup/cpu.stat').read_text()
+        stats = dict(
+            line.split(' ', 1) for line in stat_text.splitlines() if ' ' in line
+        )
+        nr_periods = int(stats.get('nr_periods', 0) or 0)
+        nr_throttled = int(stats.get('nr_throttled', 0) or 0)
+        if nr_periods:
+            status['cpu_throttled_pct'] = round(100 * nr_throttled / nr_periods, 1)
+    except (OSError, ValueError):
+        pass
+    try:
+        mem_current = int(Path('/sys/fs/cgroup/memory.current').read_text().strip())
+        mem_max_raw = Path('/sys/fs/cgroup/memory.max').read_text().strip()
+        status['memory_current_mb'] = round(mem_current / (1024 * 1024), 1)
+        if mem_max_raw != 'max':
+            mem_max = int(mem_max_raw)
+            status['memory_max_mb'] = round(mem_max / (1024 * 1024), 1)
+            status['memory_pct'] = round(100 * mem_current / mem_max, 1)
+    except (OSError, ValueError):
+        pass
+    return status
+
 def get_running_tasks_by_name(arg_str, instance_id, /):
     name = arg_str
     if '.' not in name:

@@ -17,6 +17,37 @@
 {% include 'infobox.html' with message=message %}
 <div class="row">
   <div class="col s12">
+    <h2>System Status</h2>
+    <p>
+      What this instance is doing right now and how much of its container
+      resource limits it's using.
+    </p>
+    <div class="collection">
+      <span class="collection-item">
+        <i class="fas fa-microchip"></i> CPU throttled:
+        <strong>{{ cgroup_status.cpu_throttled_pct|default:"0" }}%</strong>
+        of accounting periods
+      </span>
+      <span class="collection-item">
+        <i class="fas fa-memory"></i> Memory:
+        <strong>{{ cgroup_status.memory_current_mb|default:"?" }} MB</strong>
+        {% if cgroup_status.memory_max_mb %}
+          of {{ cgroup_status.memory_max_mb }} MB ({{ cgroup_status.memory_pct }}%)
+        {% endif %}
+      </span>
+      {% for q in queue_status %}
+      <span class="collection-item">
+        <i class="fas fa-layer-group"></i> Queue <strong>{{ q.name }}</strong>:
+        {{ q.pending|intcomma }} pending, {{ q.scheduled|intcomma }} scheduled
+      </span>
+      {% empty %}
+      <span class="collection-item no-items"><i class="fas fa-info-circle"></i> Queue status is unavailable.</span>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+<div class="row">
+  <div class="col s12">
     <h2>{{ running|length|intcomma }} Running</h2>
     <p>
       Running tasks are tasks which currently being worked on right now.
