@@ -465,30 +465,52 @@ def get_container_start_time():
 
 def get_genuinely_running_uuids(lock_stale_after):
     '''
-        Media/Source UUIDs with a TaskHistory row that both (a) satisfies
-        the "running" convention within `lock_stale_after` seconds, and
-        (b) didn't start before this container itself did -- see
-        get_container_start_time() for why (b) matters. Shared by
-        clear_stale_media_locks() (acts on this) and get_lock_status()
-        (just reports it, for the Tasks page).
+        Media/Source UUIDs backed by either a genuinely-running task, or a
+        legitimately still-*pending* one, within `lock_stale_after`
+        seconds. Shared by clear_stale_media_locks() (acts on this) and
+        get_lock_status() (just reports it, for the Tasks page).
+
+        The pending half matters because index_source()'s indexing loop
+        acquires an `index_media:{uuid}` lock and enqueues
+        migrate_to_metadata() for every newly-indexed media item
+        synchronously, well before that task actually gets dequeued and
+        run (the `filesystem` queue only has 2 workers) -- during a large
+        indexing burst (e.g. enabling several sources at once), hundreds
+        of locks can be acquired for tasks that haven't started yet.
+        Counting only "genuinely running" (start_at set) missed all of
+        these, misclassifying a completely normal backlog as orphaned
+        locks -- which clear_stale_media_locks() would then have cleared
+        and *duplicate*-rescheduled on its next 10-minute sweep, on top of
+        the original enqueued task that was always going to run anyway.
     '''
     container_start = get_container_start_time()
     running_uuids = set()
-    qs = TaskHistory.objects.running(within=lock_stale_after).values_list(
-        'task_params', 'start_at',
-    )
-    for params, start_at in qs:
-        if container_start is not None and start_at is not None:
-            if start_at.timestamp() < container_start:
-                # orphaned by a pod/container generation change -- not
-                # really running, no matter how "fresh" it looks.
+
+    def _collect(qs):
+        for params, start_at in qs:
+            if container_start is not None and start_at is not None:
+                if start_at.timestamp() < container_start:
+                    # orphaned by a pod/container generation change -- not
+                    # really running, no matter how "fresh" it looks.
+                    continue
+            try:
+                args = params[0]
+                if args:
+                    running_uuids.add(str(args[0]))
+            except (IndexError, TypeError, KeyError):
                 continue
-        try:
-            args = params[0]
-            if args:
-                running_uuids.add(str(args[0]))
-        except (IndexError, TypeError, KeyError):
-            continue
+
+    _collect(TaskHistory.objects.running(within=lock_stale_after).values_list(
+        'task_params', 'start_at',
+    ))
+
+    time_limit = timezone.now() - timedelta(seconds=lock_stale_after)
+    _collect(TaskHistory.objects.filter(
+        start_at__isnull=True,
+        failed_at__isnull=True,
+        end_at__gt=time_limit,
+    ).values_list('task_params', 'start_at'))
+
     return running_uuids
 
 
