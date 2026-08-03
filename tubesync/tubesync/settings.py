@@ -62,6 +62,19 @@ for queue_name in TaskQueue.values:
         queues[queue_name] = sqlite_tasks(queue_name, prefix='net')
     elif TaskQueue.NET.value == queue_name:
         queues[queue_name] = sqlite_tasks(queue_name, thread=True, workers=0)
+    elif TaskQueue.DB.value == queue_name:
+        # migrate_to_metadata/save_media/etc make zero YouTube/network
+        # calls -- purely local Postgres + model work -- so unlike
+        # 'limited'/'network' there's no rate-limit reason to keep this
+        # capped at the generic 2-worker default. A full library reset
+        # can legitimately enqueue thousands of these per large source
+        # (index_source enqueues one per already-known video while
+        # enumerating it, far faster than 2 workers can drain), so this
+        # queue specifically benefits from more concurrency. Kept as a
+        # fixed number rather than CPU-derived like 'network', since
+        # this is I/O-wait-on-Postgres bound, not CPU bound -- more
+        # workers than cores can still help via overlap.
+        queues[queue_name] = sqlite_tasks(queue_name, thread=True, workers=8)
     else:
         queues[queue_name] = sqlite_tasks(queue_name, thread=True)
 for django_huey_queue in DJANGO_HUEY['queues'].values():
@@ -350,7 +363,7 @@ VIDEO_HEIGHT_UPGRADE = True                 # Download again when a format with 
 # specifically). Distinct from, and doesn't weaken, sync.throttle's
 # request-frequency cooldown -- see the comment at these options' use in
 # sync/youtube.py's download_media().
-YOUTUBE_CONCURRENT_FRAGMENTS = getenv('TUBESYNC_CONCURRENT_FRAGMENTS', 8, integer=True)
+YOUTUBE_CONCURRENT_FRAGMENTS = getenv('TUBESYNC_CONCURRENT_FRAGMENTS', 24, integer=True)
 YOUTUBE_HTTP_CHUNK_SIZE = getenv('TUBESYNC_HTTP_CHUNK_SIZE', 10*1024*1024, integer=True)
 # aria2c connections-per-server when aria2c is available in the image
 # (see _aria2c_opts() in sync/youtube.py) -- ignored entirely otherwise.

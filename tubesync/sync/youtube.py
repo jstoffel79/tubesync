@@ -54,20 +54,29 @@ _aria2c_available_cache = {}
 
 def _aria2c_opts():
     '''
-        Routes video downloads through aria2c (multi-connection external
-        downloader) instead of yt-dlp's own built-in HTTP downloader.
-        Real-world reports (and this app's own measurements: ~1-2 MB/s on
-        a 2000mbps line, unmoved by concurrent_fragment_downloads/
-        http_chunk_size alone) consistently show YouTube throttles
-        yt-dlp's native downloader far more aggressively than a real
-        multi-connection client -- aria2c with -x/-s 16 is a commonly
-        reported fix, reaching 15+ MB/s where the native downloader
-        stays stuck regardless of chunk-size tuning.
+        Sets yt-dlp's external_downloader to aria2c when available.
+
+        IMPORTANT CAVEAT, confirmed by reading yt-dlp's own downloader
+        dispatch (yt_dlp.downloader.get_suitable_downloader): this only
+        takes effect for plain 'http'/'https' protocol downloads (e.g.
+        thumbnails). YouTube's actual video/audio streams report protocol
+        'http_dash_segments', which yt-dlp *always* routes to its own
+        internal DashSegmentsFD regardless of this setting -- confirmed
+        live, no aria2c process ever spawned during a real video
+        download with this enabled. So this is currently a no-op for the
+        thing that actually matters (the video bytes) -- kept because
+        it's harmless and does help the smaller http/https-protocol
+        downloads, but concurrent_fragment_downloads (which
+        DashSegmentsFD's own FragmentFD base class genuinely uses as its
+        thread-pool worker count -- verified by reading
+        yt_dlp.downloader.fragment.FragmentFD's source) is the setting
+        that actually speeds up real video downloads. Measured live:
+        raising it from 8 to 24 roughly doubled real throughput (~1.5
+        MB/s -> ~3.3 MB/s on this connection).
 
         Checked with shutil.which() and cached rather than assumed
-        present, so this safely no-ops (falls back to the native
-        downloader) on any image built before aria2c was added to the
-        Dockerfile, instead of hard-failing every download.
+        present, so this safely no-ops on any image built before aria2c
+        was added to the Dockerfile, instead of hard-failing.
     '''
     if 'available' not in _aria2c_available_cache:
         _aria2c_available_cache['available'] = shutil.which('aria2c') is not None
@@ -493,14 +502,19 @@ def download_media(
         'skip_unavailable_fragments': False,
         'sleep_interval': 10,
         'max_sleep_interval': min(15*60, max(60, settings.DOWNLOAD_MEDIA_DELAY)),
-        # Parallel byte-range requests against a single already-authorized
-        # stream URL for one video -- distinct from the sleep_interval_*
-        # settings above (and sync.throttle's cooldown), which guard
-        # against YouTube's actual ban trigger: request *frequency* across
-        # distinct videos/metadata calls. This doesn't touch that at all,
-        # it only affects how many parallel CDN connections fetch pieces
-        # of a video already permitted to download.
-        'concurrent_fragment_downloads': getattr(settings, 'YOUTUBE_CONCURRENT_FRAGMENTS', 8),
+        # The genuinely effective speed lever for real video downloads --
+        # see _aria2c_opts()'s docstring for why that setting doesn't
+        # apply here. This one is read directly by yt_dlp's own
+        # DashSegmentsFD/FragmentFD as a ThreadPoolExecutor worker count
+        # for YouTube's actual (http_dash_segments-protocol) streams.
+        # Distinct from the sleep_interval_* settings above (and
+        # sync.throttle's cooldown), which guard against YouTube's
+        # actual ban trigger: request *frequency* across distinct
+        # videos/metadata calls -- this doesn't touch that at all, it
+        # only affects how many parallel CDN connections fetch pieces of
+        # a video already permitted to download. Measured live: raising
+        # this from 8 to 24 roughly doubled real throughput.
+        'concurrent_fragment_downloads': getattr(settings, 'YOUTUBE_CONCURRENT_FRAGMENTS', 24),
         # Splits each fragment/file into smaller byte-range requests --
         # yt-dlp's own docs note this specifically for "bypassing
         # bandwidth throttling imposed by a webserver", which is a
