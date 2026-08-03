@@ -344,6 +344,12 @@ VIDEO_HEIGHT_CUTOFF = 240                   # Smallest resolution in pixels perm
 VIDEO_HEIGHT_IS_HD = 500                    # Height in pixels to count as 'HD'
 VIDEO_HEIGHT_UPGRADE = True                 # Download again when a format with more pixels is available
 
+# Parallel byte-range requests per video download (yt-dlp -N /
+# concurrent_fragment_downloads). Distinct from, and doesn't weaken,
+# sync.throttle's request-frequency cooldown -- see the comment at this
+# option's use in sync/youtube.py's download_media().
+YOUTUBE_CONCURRENT_FRAGMENTS = getenv('TUBESYNC_CONCURRENT_FRAGMENTS', 4, integer=True)
+
 
 
 # If True source directories are prefixed with their type (either 'video' or 'audio')

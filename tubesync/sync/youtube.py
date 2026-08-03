@@ -460,6 +460,16 @@ def download_media(
         'skip_unavailable_fragments': False,
         'sleep_interval': 10,
         'max_sleep_interval': min(15*60, max(60, settings.DOWNLOAD_MEDIA_DELAY)),
+        # Parallel byte-range requests against a single already-authorized
+        # stream URL for one video -- distinct from the sleep_interval_*
+        # settings above (and sync.throttle's cooldown), which guard
+        # against YouTube's actual ban trigger: request *frequency* across
+        # distinct videos/metadata calls. This doesn't touch that at all,
+        # it only affects how many parallel CDN connections fetch pieces
+        # of a video already permitted to download. Kept modest (4) rather
+        # than yt-dlp's common recommendation (8-16) since this is a
+        # long-running unattended service, not an interactive one-off.
+        'concurrent_fragment_downloads': getattr(settings, 'YOUTUBE_CONCURRENT_FRAGMENTS', 4),
         'paths': opts.get('paths', dict()),
         'postprocessor_args': opts.get('postprocessor_args', dict()),
         'postprocessor_hooks': opts.get('postprocessor_hooks', list()),
