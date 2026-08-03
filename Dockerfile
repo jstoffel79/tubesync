@@ -562,6 +562,7 @@ RUN --mount=type=cache,id=apt-lib-cache-${TARGETARCH},sharing=private,target=/va
   # Install dependencies we keep
   # Install required distro packages
   apt-get -y --no-install-recommends install \
+  aria2 \
   libmariadb3 \
   libonig5 \
   pkgconf \

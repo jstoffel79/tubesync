@@ -345,10 +345,16 @@ VIDEO_HEIGHT_IS_HD = 500                    # Height in pixels to count as 'HD'
 VIDEO_HEIGHT_UPGRADE = True                 # Download again when a format with more pixels is available
 
 # Parallel byte-range requests per video download (yt-dlp -N /
-# concurrent_fragment_downloads). Distinct from, and doesn't weaken,
-# sync.throttle's request-frequency cooldown -- see the comment at this
-# option's use in sync/youtube.py's download_media().
-YOUTUBE_CONCURRENT_FRAGMENTS = getenv('TUBESYNC_CONCURRENT_FRAGMENTS', 4, integer=True)
+# concurrent_fragment_downloads), and how large each byte-range request
+# is (--http-chunk-size, aimed at YouTube's per-connection throttle
+# specifically). Distinct from, and doesn't weaken, sync.throttle's
+# request-frequency cooldown -- see the comment at these options' use in
+# sync/youtube.py's download_media().
+YOUTUBE_CONCURRENT_FRAGMENTS = getenv('TUBESYNC_CONCURRENT_FRAGMENTS', 8, integer=True)
+YOUTUBE_HTTP_CHUNK_SIZE = getenv('TUBESYNC_HTTP_CHUNK_SIZE', 10*1024*1024, integer=True)
+# aria2c connections-per-server when aria2c is available in the image
+# (see _aria2c_opts() in sync/youtube.py) -- ignored entirely otherwise.
+YOUTUBE_ARIA2C_CONNECTIONS = getenv('TUBESYNC_ARIA2C_CONNECTIONS', 16, integer=True)
 
 
 

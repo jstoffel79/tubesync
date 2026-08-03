@@ -49,6 +49,39 @@ class YouTubeError(yt_dlp.utils.DownloadError):
     pass
 
 
+_aria2c_available_cache = {}
+
+
+def _aria2c_opts():
+    '''
+        Routes video downloads through aria2c (multi-connection external
+        downloader) instead of yt-dlp's own built-in HTTP downloader.
+        Real-world reports (and this app's own measurements: ~1-2 MB/s on
+        a 2000mbps line, unmoved by concurrent_fragment_downloads/
+        http_chunk_size alone) consistently show YouTube throttles
+        yt-dlp's native downloader far more aggressively than a real
+        multi-connection client -- aria2c with -x/-s 16 is a commonly
+        reported fix, reaching 15+ MB/s where the native downloader
+        stays stuck regardless of chunk-size tuning.
+
+        Checked with shutil.which() and cached rather than assumed
+        present, so this safely no-ops (falls back to the native
+        downloader) on any image built before aria2c was added to the
+        Dockerfile, instead of hard-failing every download.
+    '''
+    if 'available' not in _aria2c_available_cache:
+        _aria2c_available_cache['available'] = shutil.which('aria2c') is not None
+    if not _aria2c_available_cache['available']:
+        return {}
+    connections = str(getattr(settings, 'YOUTUBE_ARIA2C_CONNECTIONS', 16))
+    return {
+        'external_downloader': {'default': 'aria2c'},
+        'external_downloader_args': {
+            'aria2c': ['-x', connections, '-s', connections, '-k', '1M'],
+        },
+    }
+
+
 _nvenc_available_cache = {}
 
 
@@ -466,10 +499,20 @@ def download_media(
         # against YouTube's actual ban trigger: request *frequency* across
         # distinct videos/metadata calls. This doesn't touch that at all,
         # it only affects how many parallel CDN connections fetch pieces
-        # of a video already permitted to download. Kept modest (4) rather
-        # than yt-dlp's common recommendation (8-16) since this is a
-        # long-running unattended service, not an interactive one-off.
-        'concurrent_fragment_downloads': getattr(settings, 'YOUTUBE_CONCURRENT_FRAGMENTS', 4),
+        # of a video already permitted to download.
+        'concurrent_fragment_downloads': getattr(settings, 'YOUTUBE_CONCURRENT_FRAGMENTS', 8),
+        # Splits each fragment/file into smaller byte-range requests --
+        # yt-dlp's own docs note this specifically for "bypassing
+        # bandwidth throttling imposed by a webserver", which is a
+        # different mechanism than concurrent_fragment_downloads above
+        # (that controls how many *segments* run in parallel; this
+        # controls how a single segment's bytes get requested). Real,
+        # measured throughput on this connection was ~1-2 MB/s on a
+        # 2000mbps line before these two settings -- almost certainly
+        # YouTube's per-connection cap, which this is specifically meant
+        # to work around.
+        'http_chunk_size': getattr(settings, 'YOUTUBE_HTTP_CHUNK_SIZE', 10 * 1024 * 1024),
+        **_aria2c_opts(),
         'paths': opts.get('paths', dict()),
         'postprocessor_args': opts.get('postprocessor_args', dict()),
         'postprocessor_hooks': opts.get('postprocessor_hooks', list()),
