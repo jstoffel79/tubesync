@@ -85,6 +85,12 @@
         {% if download_progress.active %}
           Downloading <strong>{{ download_progress.media_name }}</strong>
           ({{ download_progress.elapsed_seconds|intcomma }}s so far)
+          {% if download_progress.current_mb %}
+            <br><small>
+              {{ download_progress.current_mb|floatformat:1 }} MB{% if download_progress.total_mb_estimate %} of ~{{ download_progress.total_mb_estimate|floatformat:1 }} MB{% endif %}
+              {% if download_progress.rate_mb_per_sec %} &mdash; {{ download_progress.rate_mb_per_sec|floatformat:2 }} MB/s{% endif %}
+            </small>
+          {% endif %}
         {% else %}
           No download currently in progress
         {% endif %}

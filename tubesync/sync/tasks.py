@@ -383,13 +383,129 @@ def get_download_progress():
         elapsed = None
         if task.start_at:
             elapsed = int((timezone.now() - task.start_at).total_seconds())
-        return dict(
+        result = dict(
             active=True,
             media_key=media.key,
             media_name=media.name,
             elapsed_seconds=elapsed,
         )
+        result.update(_get_download_size_and_rate(media))
+        return result
     return dict(active=False)
+
+
+_download_progress_sample_cache = {}
+
+
+def _get_download_size_and_rate(media):
+    '''
+        Current bytes-on-disk and estimated total size for the in-progress
+        download, plus a rate computed from the previous sample -- there's
+        no separate "progress" tracking mechanism (yt-dlp runs quiet, and
+        the video download itself may be delegated to aria2c as a
+        subprocess, see _aria2c_opts()), so this reads the actual
+        partially-written file(s) in YOUTUBE_DL_TEMPDIR directly rather
+        than trying to hook into either downloader's internals.
+
+        No exact file size is cached in Media.formats (yt-dlp doesn't
+        always report one for YouTube's adaptive formats), so total size
+        is *estimated* from cached bitrate * media.duration -- shown as
+        an approximation, same as yt-dlp's own CLI does in this situation.
+
+        Uses the *largest* matching file, not a sum -- verified live that
+        multiple files legitimately coexist for one download at once
+        (separate video/audio streams while downloading, then the
+        original(s) *and* a growing merged .temp.mkv once ffmpeg starts
+        muxing them), and summing them double-counts data that exists in
+        both the source stream(s) and the merge output, wildly
+        overstating progress (measured live: reported ~29GB for a video
+        whose real total was ~6.5GB during the merge phase).
+
+        Rate is computed from a single prior sample stored in a
+        module-level cache keyed by media UUID (cleared once the media
+        stops appearing as actively downloading), rather than blocking to
+        take two samples -- this fits the existing ~30s Tasks-page
+        refresh cadence instead of adding latency to page loads.
+    '''
+    tempdir = getattr(settings, 'YOUTUBE_DL_TEMPDIR', None)
+    if not tempdir:
+        return {}
+    marker = f'[{media.key}]'
+    try:
+        candidates = [
+            entry for entry in Path(tempdir).iterdir()
+            if marker in entry.name
+        ]
+        # download_media() gives each download its own scratch dir named
+        # '.yt_dlp-{key}-*' (see temp_dir_prefix in youtube.py) -- partial
+        # fragment/merge files often live in there instead of directly in
+        # tempdir, so a plain iterdir() alone misses an in-progress
+        # download entirely. Only descend into the matching one, not a
+        # full recursive scan of every download's scratch dir.
+        for subdir in Path(tempdir).glob(f'.yt_dlp-{media.key}-*'):
+            if subdir.is_dir():
+                try:
+                    candidates.extend(subdir.iterdir())
+                except OSError:
+                    continue
+    except OSError:
+        return {}
+    if not candidates:
+        return {}
+    current_bytes = 0
+    for path in candidates:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        current_bytes = max(current_bytes, size)
+
+    total_bytes_estimate = None
+    try:
+        format_str = media.get_format_str()
+    except Exception:
+        format_str = None
+    if format_str and media.duration:
+        wanted_ids = set(str(format_str).split('+'))
+        kbps_total = 0
+        for fmt in media.iter_formats():
+            if fmt.get('id') in wanted_ids:
+                kbps_total += (fmt.get('vbr') or 0) + (fmt.get('abr') or 0)
+        if kbps_total:
+            total_bytes_estimate = int(kbps_total * 1000 / 8 * media.duration)
+
+    rate_bytes_per_sec = None
+    now = timezone.now()
+    cache_key = str(media.pk)
+    previous = _download_progress_sample_cache.get(cache_key)
+    if previous is not None:
+        prev_bytes, prev_time = previous
+        elapsed = (now - prev_time).total_seconds()
+        if elapsed > 0 and current_bytes >= prev_bytes:
+            rate_bytes_per_sec = (current_bytes - prev_bytes) / elapsed
+    _download_progress_sample_cache[cache_key] = (current_bytes, now)
+    # Bound growth: only one download can genuinely be "active" per the
+    # caller's own query, but stale entries from finished/failed
+    # downloads would otherwise accumulate here forever.
+    if len(_download_progress_sample_cache) > 20:
+        oldest_key = min(
+            _download_progress_sample_cache,
+            key=lambda k: _download_progress_sample_cache[k][1],
+        )
+        if oldest_key != cache_key:
+            _download_progress_sample_cache.pop(oldest_key, None)
+
+    return dict(
+        current_mb=round(current_bytes / (1024 * 1024), 1),
+        total_mb_estimate=(
+            round(total_bytes_estimate / (1024 * 1024), 1)
+            if total_bytes_estimate else None
+        ),
+        rate_mb_per_sec=(
+            round(rate_bytes_per_sec / (1024 * 1024), 2)
+            if rate_bytes_per_sec is not None else None
+        ),
+    )
 
 
 def get_running_tasks_by_name(arg_str, instance_id, /):
