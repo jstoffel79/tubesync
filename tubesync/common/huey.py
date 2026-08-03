@@ -8,6 +8,7 @@ from huey import (
     signals, utils,
 )
 from huey.api import TaskLock
+from huey.exceptions import TaskLockedException
 from huey.storage import SqliteStorage as huey_SqliteStorage
 from pathlib import Path
 from .timestamp import datetime_to_timestamp, timestamp_to_datetime
@@ -29,6 +30,52 @@ TaskLock.acquired = property(
     _set_acquired,
     TaskLock.clear,
 )
+
+
+class LockPool:
+    '''
+        N independent named TaskLocks, first-available-wins -- huey's own
+        TaskLock only supports a single holder, with no built-in
+        "N concurrent" primitive. Used to allow a bounded amount of
+        concurrency (e.g. 2 simultaneous yt-dlp calls instead of a hard
+        single-holder lock) for tasks that still need an upper bound to
+        avoid an unbounded pile-up or tripping YouTube rate limits.
+
+        Same acquire/raise-TaskLockedException-on-failure contract as a
+        plain huey_lock_task, so it's a drop-in replacement as a
+        decorator or context manager.
+    '''
+    def __init__(self, base_name, n, /, *, queue):
+        from django_huey import lock_task
+        self._locks = [lock_task(f'{base_name}.{i}', queue=queue) for i in range(n)]
+        self._held = None
+
+    def __call__(self, fn):
+        @wraps(fn)
+        def inner(*args, **kwargs):
+            with self:
+                return fn(*args, **kwargs)
+        return inner
+
+    def __enter__(self):
+        for lock in self._locks:
+            try:
+                lock.acquire()
+            except TaskLockedException:
+                continue
+            self._held = lock
+            return self
+        raise TaskLockedException(
+            f'unable to acquire any of {len(self._locks)} locks in pool'
+        )
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._held is not None:
+            self._held.clear()
+            self._held = None
+
+    def is_locked(self):
+        return all(lock.is_locked() for lock in self._locks)
 
 
 class SqliteStorage(huey_SqliteStorage):
@@ -467,6 +514,18 @@ def historical_task(signal_name, task_obj, exception_obj=None, /, *, huey=None):
     elif exception_obj is not None:
         th.failed_at = signal_dt
         th.last_error = str(exception_obj)
+    elif signal_name == signals.SIGNAL_REVOKED:
+        # A revoked task (e.g. remove_duplicates canceling a stale
+        # duplicate -- see on_executing_remove_duplicates) never gets a
+        # SIGNAL_EXECUTING and has no exception, so without this branch
+        # start_at/failed_at both stay NULL forever: identical to a task
+        # that's still genuinely pending. That inflated
+        # get_task_breakdown()'s "pending by task type" (and the Tasks
+        # page's total) with hundreds of thousands of dead rows that will
+        # never run again, and bloated this table to 600k+ rows. Mark it
+        # failed (not pending) so it stops being counted as backlog.
+        th.failed_at = signal_dt
+        th.last_error = 'revoked (duplicate or stale task, will not run)'
     elif signal_name == signals.SIGNAL_ENQUEUED:
         scheduled_at = huey.scheduled_at_from_task(task_obj)
         if scheduled_at:

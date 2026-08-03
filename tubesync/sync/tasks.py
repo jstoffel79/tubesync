@@ -23,7 +23,7 @@ from django_huey import lock_task as huey_lock_task, task as huey_task # noqa
 from django_huey import db_periodic_task, db_task, signal as huey_signal
 from huey import crontab as huey_crontab, signals as huey_signals
 from huey.exceptions import TaskLockedException
-from common.huey import CancelExecution, dynamic_retry, register_huey_signals
+from common.huey import CancelExecution, dynamic_retry, register_huey_signals, LockPool
 from common.logger import log
 from common.models import TaskHistory
 from common.errors import (
@@ -700,6 +700,47 @@ def clear_stale_media_locks():
     if cleared:
         log.warning(f'clear_stale_media_locks: cleared {cleared} orphaned lock(s), '
                     f'rescheduled {rescheduled} task(s)')
+    close_out_orphaned_task_history()
+
+
+def close_out_orphaned_task_history():
+    '''
+        Closes out any TaskHistory row stuck satisfying the "running"
+        convention (start_at == end_at) from a *previous* container
+        generation -- i.e. its owning worker process was killed
+        mid-execution (a pod restart, a manual worker SIGTERM during a
+        deploy, the node eviction incidents from tonight) and no
+        terminal huey signal (SIGNAL_COMPLETE/SIGNAL_ERROR) ever fired
+        for it, so nothing else ever revisits or closes the row.
+
+        This is the exact same container-generation check
+        get_genuinely_running_uuids() already uses for locks, but
+        applied directly to TaskHistory rows themselves, for every task
+        type -- not just media/index_media lock holders. Caught live:
+        a clear_stale_media_locks() run itself got interrupted this way
+        and stayed shown as "Running" on the Tasks page for over an
+        hour, since clear_stale_media_locks isn't a lock-holder and so
+        was invisible to the lock-specific sweep above.
+    '''
+    container_start = get_container_start_time()
+    if container_start is None:
+        return
+    running_qs = TaskHistory.objects.running()
+    closed = 0
+    for t in running_qs.only('pk', 'start_at', 'name'):
+        if t.start_at is None or t.start_at.timestamp() >= container_start:
+            continue
+        t.failed_at = timezone.now()
+        t.end_at = t.failed_at
+        t.last_error = (
+            'orphaned: owning worker process was killed mid-execution '
+            '(container restarted before this task finished)'
+        )
+        t.save(update_fields=['failed_at', 'end_at', 'last_error'])
+        closed += 1
+    if closed:
+        log.warning(f'close_out_orphaned_task_history: closed {closed} '
+                    f'task(s) stuck "running" from a previous container generation')
 
 
 def get_lock_status():
@@ -761,14 +802,13 @@ def get_queue_activity():
         request. What IS meaningfully per-queue is concurrency: 'limited'
         (index_source/download_media_file/upgrade_media) enforces one
         yt-dlp call at a time via its single worker, and the separate
-        'yt_dlp_aux_call' lock (refresh_formats/download_media_metadata,
+        'yt_dlp_aux_call' lock pool (refresh_formats/download_media_metadata,
         moved off 'limited' onto 'network' to stop a huge backlog of one
-        from crowding out the other) enforces a second, independent "one
-        at a time" -- so at most two yt-dlp calls can be in flight
-        cluster-wide. Showing whether each is currently busy makes that
-        concurrency model visible instead of implicit.
+        from crowding out the other) allows up to 2 concurrent -- so at
+        most 3 yt-dlp calls can be in flight cluster-wide. Showing whether
+        each is currently busy makes that concurrency model visible
+        instead of implicit.
     '''
-    from django_huey import lock_task as _lock_task
     limited_running = TaskHistory.objects.running(within=3*60*60).filter(
         name__in=(
             'sync.tasks.index_source',
@@ -776,10 +816,10 @@ def get_queue_activity():
             'sync.tasks.upgrade_media',
         ),
     ).exists()
-    aux_lock = _lock_task('sync.tasks.yt_dlp_aux_call.serial', queue=Val(TaskQueue.NET))
+    aux_pool = LockPool('sync.tasks.yt_dlp_aux_call.slot', 2, queue=Val(TaskQueue.NET))
     return dict(
         limited_busy=limited_running,
-        yt_dlp_aux_busy=aux_lock.is_locked(),
+        yt_dlp_aux_busy=aux_pool.is_locked(),
     )
 
 
@@ -1436,8 +1476,8 @@ def upgrade_media(media_id):
             raise CancelExecution(_('downloaded media is better'))
         download_media_file.call_local(str(media.pk), override=True)
 
-@db_task(delay=60, priority=60, retries=3, retry_delay=600, queue=Val(TaskQueue.NET))
-@huey_lock_task('sync.tasks.yt_dlp_aux_call.serial', queue=Val(TaskQueue.NET))
+@dynamic_retry(db_task, backoff_func=lambda n: min(30*n, 300), priority=60, retries=30, queue=Val(TaskQueue.NET))
+@LockPool('sync.tasks.yt_dlp_aux_call.slot', 2, queue=Val(TaskQueue.NET))
 def download_media_metadata(media_id):
     '''
         Downloads the metadata for a media item.
@@ -1450,6 +1490,21 @@ def download_media_metadata(media_id):
         at a time (via the shared lock) so this doesn't add a second
         concurrent yt-dlp call against YouTube alongside whatever
         'limited' is doing.
+
+        retries=3/retry_delay=600 (flat) was a bug: TaskLockedException
+        from losing the race for the shared lock counts as a normal
+        failure against this task's own retry budget, same as any other
+        exception -- with only 3 tries and a 10-minute flat delay,
+        contention against refresh_formats (which gets retries=15 and a
+        much more patient backoff) could exhaust this task's retries
+        before it ever actually ran, since both compete for the exact
+        same lock. Verified in production: 23,262 of these had never run,
+        oldest since 2026-07-26 -- i.e. this task type was being starved
+        out entirely. priority=60 (vs refresh_formats' 50) means this
+        should usually win the lock once both are eligible to try again;
+        raising retries and shortening the backoff (30s, capped at 5min --
+        vs refresh_formats' n*3600+600) makes sure it actually gets that
+        many more, much sooner chances instead of dying quietly.
     '''
     try:
         media = Media.objects.get(pk=media_id)
@@ -1794,7 +1849,7 @@ def rescan_media_server(mediaserver_id):
 
 
 @dynamic_retry(db_task, backoff_func=lambda n: (n*3600)+600, priority=50, retries=15, queue=Val(TaskQueue.NET))
-@huey_lock_task('sync.tasks.yt_dlp_aux_call.serial', queue=Val(TaskQueue.NET))
+@LockPool('sync.tasks.yt_dlp_aux_call.slot', 2, queue=Val(TaskQueue.NET))
 def refresh_formats(media_id):
     '''
         Runs on the 'network' queue (which has multiple workers) rather
