@@ -61,7 +61,20 @@ for queue_name in TaskQueue.values:
     if TaskQueue.LIMIT.value == queue_name:
         queues[queue_name] = sqlite_tasks(queue_name, prefix='net')
     elif TaskQueue.NET.value == queue_name:
-        queues[queue_name] = sqlite_tasks(queue_name, thread=True, workers=0)
+        # workers=0 previously meant "CPU-derived" (max(2, cpus // 2)),
+        # which computed to exactly 2 on this pod's 4-core limit -- that
+        # silently capped this queue at 2 concurrently-running tasks
+        # *total*, no matter how many slots sync.tasks.yt_dlp_aux_call's
+        # LockPool allowed (raised to 3 without checking this first).
+        # Those 2 threads are also shared with download_source_images/
+        # download_media_image (plain thumbnail fetches, no lock), which
+        # further starved the aux-pool tasks. This is I/O-wait-on-HTTP
+        # bound, not CPU bound, same reasoning as the 'database' queue
+        # below -- more threads than cores can still help via overlap.
+        # Set explicitly above the aux-pool size so the pool's slots can
+        # actually all be exercised concurrently, with headroom left for
+        # the non-locked image-download tasks on this same queue.
+        queues[queue_name] = sqlite_tasks(queue_name, thread=True, workers=5)
     elif TaskQueue.DB.value == queue_name:
         # migrate_to_metadata/save_media/etc make zero YouTube/network
         # calls -- purely local Postgres + model work -- so unlike
