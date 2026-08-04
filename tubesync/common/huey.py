@@ -1,5 +1,6 @@
 import datetime
 import subprocess
+import threading
 import time
 import uuid
 from functools import partial, wraps
@@ -44,11 +45,28 @@ class LockPool:
         Same acquire/raise-TaskLockedException-on-failure contract as a
         plain huey_lock_task, so it's a drop-in replacement as a
         decorator or context manager.
+
+        The held lock is tracked per-thread (`threading.local`), not as
+        a plain instance attribute -- a single LockPool instance (e.g.
+        as a decorator, which is only instantiated once at import time)
+        is shared by every huey worker *thread* that calls the decorated
+        function, and queues like 'network' run with multiple threads.
+        With a plain `self._held`, two threads racing through
+        __enter__/__exit__ concurrently would stomp on the same
+        attribute: thread A acquires slot 0 and sets self._held, then
+        thread B acquires slot 1 and overwrites self._held before A's
+        __exit__ runs -- so A's __exit__ ends up clearing B's lock
+        instead of its own, and slot 0 is never cleared. Seen live in
+        production: both slots of the 'sync.tasks.yt_dlp_aux_call.slot'
+        pool ended up permanently held with no task actually running,
+        silently deadlocking every format-refresh/metadata task
+        forever (they'd raise TaskLockedException, retry with backoff,
+        and pile up) until the entire task queue was manually reset.
     '''
     def __init__(self, base_name, n, /, *, queue):
         from django_huey import lock_task
         self._locks = [lock_task(f'{base_name}.{i}', queue=queue) for i in range(n)]
-        self._held = None
+        self._local = threading.local()
 
     def __call__(self, fn):
         @wraps(fn)
@@ -63,16 +81,17 @@ class LockPool:
                 lock.acquire()
             except TaskLockedException:
                 continue
-            self._held = lock
+            self._local.held = lock
             return self
         raise TaskLockedException(
             f'unable to acquire any of {len(self._locks)} locks in pool'
         )
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self._held is not None:
-            self._held.clear()
-            self._held = None
+        held = getattr(self._local, 'held', None)
+        if held is not None:
+            held.clear()
+            self._local.held = None
 
     def is_locked(self):
         return all(lock.is_locked() for lock in self._locks)
