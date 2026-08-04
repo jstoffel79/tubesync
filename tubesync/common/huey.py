@@ -399,13 +399,29 @@ def dynamic_retry(task_func=None, /, *args, **kwargs):
                     task is not None
                 except NameError:
                     raise exc
+                # A TaskLockedException here means this call lost the race
+                # for a LockPool slot (e.g. sync.tasks.yt_dlp_aux_call) --
+                # that's contention between our own worker threads, not a
+                # real failure of the underlying work, and it fails near-
+                # instantly (no actual yt-dlp/network call ever happened).
+                # Running it through the caller's real-failure backoff_func
+                # (tuned for genuine repeated errors, e.g. hours-scale for
+                # refresh_formats) let a handful of lock-contention misses
+                # push a task hours into the future within minutes, making
+                # a perfectly healthy backlog look permanently stuck. Use
+                # a short, capped backoff for this case regardless of what
+                # the decorated function configured.
+                if isinstance(exc, TaskLockedException):
+                    lock_backoff = lambda attempt: min(30 * attempt, 300)
+                else:
+                    lock_backoff = backoff
                 for attempt in range(1, 240):
-                    if backoff(attempt) > task.retry_delay:
-                        task.retry_delay = backoff(attempt)
+                    if lock_backoff(attempt) > task.retry_delay:
+                        task.retry_delay = lock_backoff(attempt)
                         break
                     # insanity, but handle it anyway
                     if 239 == attempt:
-                        task.retry_delay = backoff(attempt)
+                        task.retry_delay = lock_backoff(attempt)
                 raise exc
         kwargs.update(dict(
             context=True,
