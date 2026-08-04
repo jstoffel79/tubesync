@@ -932,7 +932,7 @@ def get_queue_activity():
             'sync.tasks.upgrade_media',
         ),
     ).exists()
-    aux_pool = LockPool('sync.tasks.yt_dlp_aux_call.slot', 2, queue=Val(TaskQueue.NET))
+    aux_pool = LockPool('sync.tasks.yt_dlp_aux_call.slot', 3, queue=Val(TaskQueue.NET))
     return dict(
         limited_busy=limited_running,
         yt_dlp_aux_busy=aux_pool.is_locked(),
@@ -1593,7 +1593,7 @@ def upgrade_media(media_id):
         download_media_file.call_local(str(media.pk), override=True)
 
 @dynamic_retry(db_task, backoff_func=lambda n: min(30*n, 300), priority=60, retries=30, queue=Val(TaskQueue.NET))
-@LockPool('sync.tasks.yt_dlp_aux_call.slot', 2, queue=Val(TaskQueue.NET))
+@LockPool('sync.tasks.yt_dlp_aux_call.slot', 3, queue=Val(TaskQueue.NET))
 def download_media_metadata(media_id):
     '''
         Downloads the metadata for a media item.
@@ -1965,7 +1965,7 @@ def rescan_media_server(mediaserver_id):
 
 
 @dynamic_retry(db_task, backoff_func=lambda n: (n*3600)+600, priority=50, retries=15, queue=Val(TaskQueue.NET))
-@LockPool('sync.tasks.yt_dlp_aux_call.slot', 2, queue=Val(TaskQueue.NET))
+@LockPool('sync.tasks.yt_dlp_aux_call.slot', 3, queue=Val(TaskQueue.NET))
 def refresh_formats(media_id):
     '''
         Runs on the 'network' queue (which has multiple workers) rather
